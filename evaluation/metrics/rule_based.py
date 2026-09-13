@@ -19,6 +19,29 @@ from typing import Any
 class RuleBasedMetrics:
     """研究报告质量评测指标集合（规则版）。"""
 
+    @staticmethod
+    def false_supported_rate(verification: dict[str, Any] | None) -> float | None:
+        """Return the verified contradiction rate for asserted report claims.
+
+        A generated report presents every extracted factual claim as an
+        assertion.  Claims that the EvidenceVerifier marks ``contradicted`` are
+        therefore false-supported assertions for the Policy-track safety gate.
+        Missing/failed verification and an empty claim set are deliberately
+        represented by ``None`` so promotion can fail closed instead of treating
+        absent evidence as a perfect zero-error score.
+        """
+
+        if not isinstance(verification, dict) or verification.get("error"):
+            return None
+        try:
+            total = int(verification.get("total_claims", 0) or 0)
+            contradicted = int(verification.get("contradicted", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if total <= 0 or contradicted < 0 or contradicted > total:
+            return None
+        return contradicted / total
+
     # -----------------------------------------------------------------------
     # 1. 事实准确性 (Factual Accuracy) — 字符串匹配版（快速但粗糙）
     # -----------------------------------------------------------------------
@@ -149,7 +172,7 @@ class RuleBasedMetrics:
     # 3. 引用覆盖率 (Citation Coverage)
     # -----------------------------------------------------------------------
     @staticmethod
-    def citation_coverage(report: str) -> float:
+    def citation_coverage(report: str, *, exclude_reference_appendix: bool = True) -> float:
         """
         计算报告中包含引用来源的段落比例。
 
@@ -161,12 +184,47 @@ class RuleBasedMetrics:
         if not report:
             return 0.0
 
-        paragraphs = [p.strip() for p in report.split("\n") if p.strip()]
+        # Treat only claim-bearing body paragraphs as the denominator.  A bare
+        # bibliography line (or an automatically appended source list) is not a
+        # claim and must not inflate citation coverage.  This keeps the metric
+        # useful for reports that always append a references section.
+        body = report
+        valid_reference_ids: set[str] | None = None
+        if exclude_reference_appendix:
+            sections = re.split(
+                r"(?im)^\s{0,3}#{0,6}\s*(?:参考来源|参考文献|来源列表|references?|sources?)\s*:?[ \t]*$",
+                body,
+                maxsplit=1,
+            )
+            body = sections[0]
+            if len(sections) == 2:
+                valid_reference_ids = {
+                    left or right
+                    for left, right in re.findall(
+                        r"(?m)^\s*(?:[-*]\s*)?(?:\[(\d+)\]|(\d+)\.)\s+",
+                        sections[1],
+                    )
+                }
+            body = re.split(
+                r"(?im)^\s{0,3}#{1,6}\s*(?:元信息|metadata)\s*:?[ \t]*$",
+                body,
+                maxsplit=1,
+            )[0]
+
+        # Prefer Markdown paragraphs; if a report is line-oriented, retain each
+        # non-empty line so existing reports continue to receive a score.
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+        if len(paragraphs) == 1 and "\n" in paragraphs[0]:
+            paragraphs = [p.strip() for p in paragraphs[0].splitlines() if p.strip()]
+        paragraphs = [
+            p for p in paragraphs
+            if not re.match(r"^#{1,6}\s+", p)
+            and not re.match(r"^(?:[-*]\s*)?(?:\[\d+\]\s*)?(?:https?://|arxiv\.org)", p, re.I)
+        ]
         if not paragraphs:
             return 0.0
 
         citation_patterns = [
-            r"\[\d+\]",
             r"\[来源[：:]",
             r"【来源[：:]",
             r"\(来源[：:]",
@@ -176,6 +234,13 @@ class RuleBasedMetrics:
 
         cited_paragraphs = 0
         for para in paragraphs:
+            reference_ids = re.findall(r"\[(\d+)\]", para)
+            if reference_ids and (
+                valid_reference_ids is None
+                or any(reference_id in valid_reference_ids for reference_id in reference_ids)
+            ):
+                cited_paragraphs += 1
+                continue
             for pattern in citation_patterns:
                 if re.search(pattern, para):
                     cited_paragraphs += 1
@@ -274,6 +339,22 @@ class RuleBasedMetrics:
         }
 
         w = weights if weights is not None else default_weights
+
+        # ResearchBench historically emitted two factual aliases
+        # (``factual_accuracy_str`` and ``factual_accuracy_sem``), while this
+        # scorer consumes the canonical ``factual_accuracy`` key.  Normalize
+        # aliases here so callers using old result files are scored correctly.
+        metrics = dict(metrics)
+        if "factual_accuracy" not in metrics:
+            aliases = [
+                value
+                for key, value in metrics.items()
+                if key in {"factual_accuracy_str", "factual_accuracy_sem"}
+                and isinstance(value, (int, float))
+            ]
+            if aliases:
+                metrics["factual_accuracy"] = sum(aliases) / len(aliases)
+
         total_score = 0.0
         total_weight = 0.0
 

@@ -249,7 +249,7 @@ class Judge:
     def shape_reward(self, scores: dict[str, float]) -> float:
         """将五维评分转换为 GRPO 可用的单值 reward。
 
-        公式: R_grpo = clip(composite * 2 - 1, -1, 1)
+        公式: R_grpo = clip(composite / 5 - 1, -1, 1)
         其中 composite 是五维度加权平均分，范围 [0, 10]。
 
         Args:
@@ -270,7 +270,7 @@ class Judge:
             composite /= weight_sum
 
         # 映射到 [-1, 1]
-        r = composite * 2.0 - 1.0
+        r = composite / 5.0 - 1.0
         return max(-1.0, min(1.0, r))
 
     def _compute_efficiency_score(self, num_searches: int) -> float:

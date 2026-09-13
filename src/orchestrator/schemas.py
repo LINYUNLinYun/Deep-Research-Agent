@@ -19,6 +19,8 @@ __all__ = [
     "AgentResult",
     "ResearchReport",
     "RunConfig",
+    "ResearchState",
+    "DecisionRecord",
 ]
 
 
@@ -107,6 +109,7 @@ class AgentResult:
     trajectory: list[dict] = field(default_factory=list)
     token_usage: int = 0
     confidence: float = 0.0
+    evidence_bundle: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -134,6 +137,53 @@ class ResearchReport:
     # Explicit adversarial outcome; skipped/failed must never look successful.
     adversarial_status: str = "not_run"
     adversarial_reason: str = ""
+    # Harness telemetry: every adaptive routing/replan/stopping decision is
+    # retained so experiments can explain *why* a run changed course.
+    decision_trace: list[dict[str, Any]] = field(default_factory=list)
+    evidence: list[Any] = field(default_factory=list)
+    source_catalog: list[dict[str, Any]] = field(default_factory=list)
+    claim_evidence_edges: list[dict[str, Any]] = field(default_factory=list)
+    open_questions: list[dict[str, Any]] = field(default_factory=list)
+    evidence_verification: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ResearchState:
+    """Compact, serialisable snapshot consumed by adaptive controllers."""
+
+    coverage: float = 0.0
+    unresolved_claims: list[str] = field(default_factory=list)
+    evidence_novelty: float = 0.0
+    failures: list[dict[str, Any]] = field(default_factory=list)
+    remaining_budget: int = 0
+    successful_tasks: int = 0
+    total_tasks: int = 0
+
+
+@dataclass
+class DecisionRecord:
+    """Auditable Harness decision and the signals that produced it."""
+
+    action: str
+    signals: dict[str, Any] = field(default_factory=dict)
+    reason: str = ""
+    model: str = ""
+    tool: str = ""
+    cost: float = 0.0
+    latency: float = 0.0
+    timestamp: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action,
+            "signals": self.signals,
+            "reason": self.reason,
+            "model": self.model,
+            "tool": self.tool,
+            "cost": self.cost,
+            "latency": self.latency,
+            "timestamp": self.timestamp,
+        }
 
 
 @dataclass
@@ -154,3 +204,13 @@ class RunConfig:
     max_sub_questions: int = 8
     enable_adversarial: bool = True
     enable_evolution: bool = False
+    enable_replan: bool = True
+    replan_failure_ratio: float = 0.35
+    replan_min_novelty: float = 0.08
+    replan_novelty_patience: int = 1
+    min_usable_confidence: float = 0.45
+    adversarial_confidence_threshold: float = 0.8
+    adversarial_timeout_seconds: float = 180.0
+    token_budget: int = 100_000
+    evidence_replan_threshold: float = 0.6
+    evidence_replan_max_tasks: int = 3

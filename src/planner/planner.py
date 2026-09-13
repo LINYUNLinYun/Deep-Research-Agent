@@ -121,11 +121,17 @@ class Planner:
         budget_tracker: 可选的预算追踪器，监控 planning 阶段的 token 消耗。
     """
 
-    def __init__(self, policy, budget_tracker: BudgetTracker | None = None, max_tasks: int = 8) -> None:
+    def __init__(
+        self,
+        policy,
+        budget_tracker: BudgetTracker | None = None,
+        max_tasks: int = 8,
+        max_attempts: int = 3,
+    ) -> None:
         self.policy = policy
         self.budget_tracker = budget_tracker or BudgetTracker()
         self._last_raw_json: str = ""
-        self.max_attempts = 3
+        self.max_attempts = max(1, int(max_attempts))
         self.max_tasks = max(1, min(int(max_tasks), 8))
 
     # ------------------------------------------------------------------
@@ -160,6 +166,7 @@ class Planner:
         failed_tasks: list[SubTask],
         existing_results: list[AgentResult],
         reason: str,
+        preserve_threshold: float = 0.6,
     ) -> DAG:
         """增量重规划：保留高置信度结果，修改失败任务。
 
@@ -173,15 +180,26 @@ class Planner:
             DAG: 新的执行计划。
         """
         # 筛选保留的结果（confidence >= 0.6 且状态为 SUCCESS）
-        preserved = [
-            {
+        preserved = []
+        for r in existing_results:
+            if r.status.value != "success" or r.confidence < preserve_threshold:
+                continue
+            source_urls: list[str] = []
+            for step in r.trajectory:
+                payload = step.get("result") if isinstance(step, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                for item in (payload.get("results", []) or payload.get("papers", [])):
+                    if isinstance(item, dict):
+                        url = item.get("url") or item.get("pdf_url")
+                        if url and str(url) not in source_urls:
+                            source_urls.append(str(url))
+            preserved.append({
                 "task_id": r.task_id,
                 "output": str(r.output)[:500] if r.output else "",
                 "confidence": r.confidence,
-            }
-            for r in existing_results
-            if r.status.value == "success" and r.confidence >= 0.6
-        ]
+                "source_urls": source_urls[:12],
+            })
 
         failed_json = json.dumps(
             [{"task_id": t.task_id, "description": t.description, "type": t.task_type.value} for t in failed_tasks],
@@ -335,8 +353,16 @@ class Planner:
             )
 
         dag = DAG()
+        task_ids: list[str] = []
         for item in sub_tasks_raw:
+            if not isinstance(item, dict):
+                raise PlanParseError("Each sub_task must be a JSON object.")
             task = self._deserialize_subtask(item)
+            if not task.task_id.strip() or task.task_id == "unknown":
+                raise PlanParseError("Every sub_task must have a non-empty task_id.")
+            if task.task_id in task_ids:
+                raise PlanParseError(f"Duplicate task_id: {task.task_id}")
+            task_ids.append(task.task_id)
             dag.add_node(task.task_id)
 
         # 第二遍添加边
@@ -344,8 +370,9 @@ class Planner:
             task_id = item.get("task_id", "")
             for dep in item.get("dependencies", []):
                 if not dag.has_node(dep):
-                    # 依赖指向不存在的任务，创建占位节点
-                    dag.add_node(dep)
+                    raise PlanParseError(
+                        f"Task '{task_id}' references unknown dependency '{dep}'."
+                    )
                 dag.add_edge(dep, task_id)  # dep -> task_id (task_id 依赖 dep)
 
         # 验证无环

@@ -6,7 +6,7 @@ scripts/run_all_experiments.py
 DeepResearch Agent 批量实验脚本
 
 一键运行全部核心实验，生成结构化汇总报告：
-  1. 模块消融实验（full / no_adversarial / no_compressor / no_memory / no_evolution）
+  1. 模块消融实验（full / no_adversarial / no_compressor / no_memory）
   2. 对抗轮数消融（0/1/2/3 轮）
   3. 标准评测集（ResearchBench 规则指标）
   4. 多领域对比（tech / med / fin 分领域评测）

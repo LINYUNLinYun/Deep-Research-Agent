@@ -1,0 +1,43 @@
+dataset_id: researchbench_v1
+version: v1
+source: evaluation.benchmarks.research_bench.ResearchBench.DEFAULT_QUESTIONS
+expected_count: 35
+splits:
+  miner:
+    - tech_001
+    - med_001
+    - fin_001
+    - tech_003
+    - med_003
+    - fin_003
+    - tech_005
+    - med_005
+    - fin_005
+    - tech_007
+    - energy_001
+    - auto_001
+  development:
+    - tech_004
+    - tech_008
+    - med_004
+    - fin_004
+    - edu_001
+    - law_001
+    - retail_001
+    - game_001
+    - cross_001
+  held_out:
+    - tech_002
+    - tech_006
+    - med_002
+    - med_006
+    - fin_002
+    - fin_006
+    - edu_002
+    - law_002
+    - energy_002
+    - retail_002
+    - auto_002
+    - game_002
+    - media_001
+    - cross_002

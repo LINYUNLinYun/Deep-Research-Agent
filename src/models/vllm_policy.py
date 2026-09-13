@@ -223,6 +223,8 @@ class VLLMPolicy:
             choice = resp.choices[0]
             raw_msg = choice.message
             content = raw_msg.content or ""
+            if getattr(choice, "finish_reason", None) == "length":
+                self.was_truncated = True
 
             usage = getattr(resp, "usage", None)
             print(

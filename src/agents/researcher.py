@@ -12,12 +12,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from typing import Any
 
 from .base_agent import BaseAgent
-from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus
+from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus, TaskType
+from ..tools.execution_policy import ToolExecutionPolicy
+from ..tools.search_controller import SearchController
 from ..utils.tracing import trace_agent
 from ..utils.runtime_context import current_date, runtime_context_text, resolve_relative_dates
 
@@ -48,10 +51,33 @@ class ResearcherAgent(BaseAgent):
         policy,
         tools: list | None = None,
         max_turns: int = 10,
+        tool_policy: ToolExecutionPolicy | None = None,
+        search_controller: SearchController | None = None,
+        evidence_gain_threshold: float = 0.15,
+        evidence_patience: int = 1,
+        max_tool_calls: int | None = None,
     ) -> None:
         super().__init__(name, policy, tools)
         self.max_turns = max_turns
         self.tool_map: dict[str, Any] = {t.name: t for t in (tools or [])}
+        self.tool_policy = tool_policy or ToolExecutionPolicy()
+        # AgentPool copies the tools list but intentionally shares the tool
+        # instances. Attach one controller to the shared web-search tool so
+        # independent workers deduplicate one another's queries and URLs.
+        shared_controller = search_controller
+        web_tool = self.tool_map.get("web_search")
+        if shared_controller is None and web_tool is not None:
+            shared_controller = getattr(web_tool, "search_controller", None)
+            if shared_controller is None:
+                shared_controller = SearchController()
+                try:
+                    setattr(web_tool, "search_controller", shared_controller)
+                except Exception:
+                    pass
+        self.search_controller = shared_controller or SearchController()
+        self.evidence_gain_threshold = min(max(float(evidence_gain_threshold), 0.0), 1.0)
+        self.evidence_patience = max(int(evidence_patience), 1)
+        self.max_tool_calls = max_tool_calls if max_tool_calls is None else max(int(max_tool_calls), 1)
 
     @trace_agent(name="researcher.run", tags=["agent", "researcher"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
@@ -66,6 +92,21 @@ class ResearcherAgent(BaseAgent):
         trajectory: list[dict] = []
         total_tokens: int = 0
         empty_search_observed = False
+        search_budget_stop_observed = False
+        successful_search_observed = False
+        tool_call_count = 0
+        low_novelty_streak = 0
+        evidence_seen: set[str] = set()
+        self._active_search_context = {
+            "query": context.get("query", ""),
+            "task_id": task.task_id,
+            "stage": "verify" if task.task_type == TaskType.VERIFY else "worker",
+            "task_description": task.description,
+            "search_hints": list(task.search_hints or []),
+            "query_type": task.expected_type,
+            "unresolved_claims": context.get("unresolved_claims", []),
+            "remaining_search_budget": self.max_tool_calls or self.max_turns,
+        }
 
         # 构建任务描述
         task_desc = self._build_task_prompt(task, context)
@@ -170,6 +211,21 @@ class ResearcherAgent(BaseAgent):
 
             # 无工具调用 → 任务完成
             if not tool_calls:
+                # Factual/searchable tasks must use at least one tool. The
+                # previous implementation accepted a turn-zero answer from
+                # model memory, which violated the system prompt and yielded
+                # unsupported claims.
+                if turn == 0:
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"You did not use any tools. You MUST call the '{fallback_tool}' tool now "
+                            "before answering. Return the final summary only after using the tool."
+                        ),
+                    })
+                    trajectory.append({"turn": turn, "event": "tool_required", "fallback_tool": fallback_tool})
+                    continue
                 # B方案：检测 LLM 回复是否包含明显的工具失败说明
                 if self._is_tool_failure_explanation(content):
                     return AgentResult(
@@ -180,7 +236,18 @@ class ResearcherAgent(BaseAgent):
                         token_usage=total_tokens,
                         confidence=0.0,
                     )
-                if empty_search_observed:
+                dependency_evidence_available = any(
+                    key.startswith("dep:")
+                    and isinstance(value, AgentResult)
+                    and value.status == AgentStatus.SUCCESS
+                    and bool(value.output)
+                    for key, value in context.items()
+                )
+                if (
+                    empty_search_observed
+                    and not successful_search_observed
+                    and not (search_budget_stop_observed and dependency_evidence_available)
+                ):
                     return AgentResult(
                         task_id=task.task_id,
                         status=AgentStatus.FAILED,
@@ -190,7 +257,9 @@ class ResearcherAgent(BaseAgent):
                         confidence=0.0,
                     )
                 confidence = self._extract_confidence(content)
-                return AgentResult(
+                if task.task_type == TaskType.VERIFY:
+                    content = self._normalise_verify_output(content, task)
+                final_result = AgentResult(
                     task_id=task.task_id,
                     status=AgentStatus.SUCCESS,
                     output=content,
@@ -198,6 +267,9 @@ class ResearcherAgent(BaseAgent):
                     token_usage=total_tokens,
                     confidence=confidence,
                 )
+                from ..evidence import EvidenceLedger
+                final_result.evidence_bundle = EvidenceLedger().collect([final_result]).to_dict()
+                return final_result
 
             # 执行工具调用
             tool_results = []
@@ -211,10 +283,27 @@ class ResearcherAgent(BaseAgent):
 
                 if tool_name == "web_search":
                     args = self._normalize_temporal_search_args(args, task, context)
-                result = await self._execute_tool(tool_name, args)
+                tool_call_count += 1
+                self._active_search_context["remaining_search_budget"] = max(
+                    int(self.max_tool_calls or self.max_turns) - tool_call_count, 0
+                )
+                if self.max_tool_calls is not None and tool_call_count > self.max_tool_calls:
+                    result = {
+                        "error_type": "budget",
+                        "hard_cap_reached": True,
+                        "stop_search_requested": True,
+                        "message": "tool call budget exhausted; summarize gathered evidence or state what remains unknown",
+                    }
+                    search_budget_stop_observed = True
+                else:
+                    result = await self._execute_tool(tool_name, args, context=context)
 
                 # B方案：检测工具返回结果是否包含 error 字段
-                if isinstance(result, dict) and result.get("error"):
+                if (
+                    isinstance(result, dict)
+                    and result.get("error")
+                    and result.get("error_type") != "budget"
+                ):
                     error_msg = result["error"]
                     trajectory.append({
                         "turn": turn,
@@ -235,6 +324,7 @@ class ResearcherAgent(BaseAgent):
                 tool_results.append({
                     "tool_call_id": tc.get("id", ""),
                     "name": tool_name,
+                    "args": dict(args),
                     "result": result,
                 })
                 trajectory.append({
@@ -242,29 +332,72 @@ class ResearcherAgent(BaseAgent):
                     "role": "tool",
                     "tool_call_id": tc.get("id", ""),
                     "name": tool_name,
+                    "args": dict(args),
                     "result": result,
                 })
+                execution_meta = result.get("_tool_execution") if isinstance(result, dict) else None
+                if execution_meta:
+                    trajectory[-1]["execution"] = execution_meta
 
-            # 检测搜索结果是否全为空（工具返回了但无有效内容）
+            # Evidence-gain stopping: a round with no new evidence is a
+            # stronger signal than a fixed search-round count. SearchController
+            # reports novelty; the local fallback keeps custom tools compatible.
             all_empty = True
+            evidence_action_observed = False
+            round_novelty_values: list[float] = []
             for tr in tool_results:
-                if tr["name"] == "web_search":
-                    res = tr["result"]
-                    if isinstance(res, dict) and res.get("results"):
-                        for r in res["results"]:
-                            if r.get("snippet", "").strip():
-                                all_empty = False
-                                break
-                    else:
-                        empty_search_observed = True
-            
-            # 如果已搜索 2+ 轮或搜索结果全空，强制要求总结
-            search_count = sum(1 for t in trajectory if t.get("role") == "tool" and t.get("name") == "web_search")
-            force_summary = False
-            if search_count >= 2:
-                force_summary = True
-            if all_empty and tool_results:
-                force_summary = True
+                tool_name = tr["name"]
+                if tool_name not in {
+                    "web_search", "arxiv_reader", "browser", "file_reader",
+                    "calculator", "code_sandbox",
+                }:
+                    continue
+                evidence_action_observed = True
+                res = tr["result"]
+                if isinstance(res, dict) and res.get("hard_cap_reached"):
+                    search_budget_stop_observed = True
+                if tool_name == "web_search" and isinstance(res, dict):
+                    novelty = res.get("evidence_novelty")
+                    if isinstance(novelty, (int, float)):
+                        round_novelty_values.append(float(novelty))
+                keys = self._evidence_keys_for_tool(tool_name, res)
+                if keys:
+                    all_empty = False
+                    successful_search_observed = True
+                    new_keys = keys - evidence_seen
+                    evidence_seen.update(keys)
+                    if not round_novelty_values or tool_name != "web_search":
+                        round_novelty_values.append(len(new_keys) / max(len(keys), 1))
+                elif tool_name in {"web_search", "arxiv_reader", "browser", "file_reader"}:
+                    empty_search_observed = True
+
+            if round_novelty_values:
+                round_novelty = max(round_novelty_values)
+            elif all_empty and evidence_action_observed:
+                round_novelty = 0.0
+            else:
+                # Administrative tools such as notepad neither prove evidence
+                # gain nor justify an early stop.
+                round_novelty = 1.0 if tool_results else 0.0
+            if evidence_action_observed and round_novelty <= self.evidence_gain_threshold:
+                low_novelty_streak += 1
+            elif evidence_action_observed:
+                low_novelty_streak = 0
+            policy_stop = any(
+                isinstance(item.get("result"), dict) and item["result"].get("stop_search_requested")
+                for item in tool_results
+            )
+            force_summary = bool(tool_results) and (
+                low_novelty_streak >= self.evidence_patience or policy_stop
+            )
+            if force_summary:
+                trajectory.append({
+                    "turn": turn,
+                    "event": "policy_stop" if policy_stop else "evidence_gain_stop",
+                    "novelty": round(round_novelty, 4),
+                    "streak": low_novelty_streak,
+                    "unique_evidence": len(evidence_seen),
+                })
 
             # 将 assistant message 和 tool results 追加到 messages
             assistant_msg = {
@@ -324,10 +457,10 @@ class ResearcherAgent(BaseAgent):
             "3. For most research tasks, START with web_search or arxiv_reader.\n"
             "4. If search results are too short, use browser to read the full article.\n"
             "5. If the task involves numbers/calculations, use calculator or code_sandbox.\n"
-            "6. You may call tools AT MOST 2 times total. After that you MUST summarize.\n"
+            f"6. You may call tools AT MOST {self._tool_call_limit()} times total. After that you MUST summarize.\n"
             "7. Only after gathering information, provide a concise summary with a confidence score (0-1).\n"
             "8. NEVER greet the user or ask what they want to search — just execute immediately.\n"
-            "9. If you have already performed 2 tool calls, do NOT call more — write the final summary now."
+            f"9. If you have already performed {self._tool_call_limit()} tool calls, do NOT call more — write the final summary now."
         )
 
     def _system_prompt_direct_analysis(self) -> str:
@@ -419,8 +552,8 @@ class ResearcherAgent(BaseAgent):
             "## INSTRUCTIONS:",
             f"1. First, call the '{primary_tool}' tool with a relevant query to gather information.",
             "2. Review the results.",
-            f"3. If needed, call '{primary_tool}' ONE MORE time with a refined query.",
-            "   You may call tools AT MOST 2 times total. After the 2nd call, you MUST write the final summary.",
+            f"3. If needed, continue with a refined query or another appropriate tool within the shared budget.",
+            f"   You may call tools AT MOST {self._tool_call_limit()} times total. After the final allowed call, you MUST write the final summary.",
             "4. If search results are too short, you may use 'browser' to read the full article (counts as 1 tool call).",
             "5. If calculations are needed, use 'calculator' or 'code_sandbox' (counts as 1 tool call).",
             "6. Finally, summarize your findings in Chinese with a confidence score (0-1).",
@@ -437,17 +570,156 @@ class ResearcherAgent(BaseAgent):
             if ctx_parts:
                 lines.append("\n## Context:")
                 lines.extend(ctx_parts)
+        dependency_parts = []
+        for dependency_id in task.dependencies:
+            dependency = context.get(f"dep:{dependency_id}")
+            if isinstance(dependency, AgentResult) and dependency.status == AgentStatus.SUCCESS:
+                dependency_parts.append(f"- {dependency_id}: {dependency.output}")
+        if dependency_parts:
+            lines.append("\n## Dependency evidence (use before requesting more searches):")
+            lines.extend(dependency_parts)
+        if context.get("compressed_context"):
+            lines.append("\n## Compressed dependency context:")
+            lines.append(str(context["compressed_context"]))
+        if task.task_type == TaskType.VERIFY:
+            lines.extend([
+                "\n## REQUIRED VERIFY OUTPUT CONTRACT:",
+                "Return JSON only: {\"claim_id\": string, \"status\": \"supported\"|\"contradicted\"|\"unknown\", "
+                "\"evidence\": [{\"url\": string, \"span\": string}], \"reason\": string, \"confidence\": number}.",
+                "Never return supported without a non-empty attributable evidence span. When uncertain, return unknown.",
+            ])
         return "\n".join(lines)
 
-    async def _execute_tool(self, tool_name: str, args: dict) -> dict:
+    @staticmethod
+    def _normalise_verify_output(content: str, task: SubTask) -> str:
+        """Fail closed while keeping every VERIFY result machine-readable."""
+        claim_match = re.search(r"claim_id=([\w:-]+)", task.description)
+        claim_id = claim_match.group(1) if claim_match else task.task_id
+        raw = content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            payload = {
+                "claim_id": claim_id,
+                "status": "unknown",
+                "evidence": [],
+                "reason": "unparseable_verify_output",
+                "confidence": 0.0,
+                "raw_summary": content[:1000],
+            }
+        if not isinstance(payload, dict):
+            payload = {"claim_id": claim_id, "status": "unknown", "evidence": [], "reason": "invalid_verify_shape", "confidence": 0.0}
+        payload["claim_id"] = str(payload.get("claim_id") or claim_id)
+        if payload.get("status") not in {"supported", "contradicted", "unknown"}:
+            payload["status"] = "unknown"
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, list):
+            evidence = []
+        evidence = [
+            item for item in evidence
+            if isinstance(item, dict) and str(item.get("url", "")).strip() and str(item.get("span", "")).strip()
+        ]
+        payload["evidence"] = evidence
+        if payload["status"] == "supported" and not evidence:
+            payload["status"] = "unknown"
+            payload["reason"] = "supported_without_attributable_span"
+        try:
+            payload["confidence"] = max(0.0, min(1.0, float(payload.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            payload["confidence"] = 0.0
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _tool_call_limit(self) -> int:
+        """Return the single budget value rendered into every prompt."""
+        return int(self.max_tool_calls or self.max_turns)
+
+    @staticmethod
+    def _evidence_keys_for_tool(tool_name: str, result: Any) -> set[str]:
+        """Extract stable evidence identities from every evidence-producing tool.
+
+        The controller may provide a more precise novelty score for web
+        search.  This fallback prevents arXiv/browser/file/calculation calls
+        from being mistaken for empty searches.
+        """
+        if isinstance(result, dict) and result.get("error_type") == "budget":
+            return set()
+        values: list[Any] = []
+        if isinstance(result, dict):
+            for field in ("results", "papers", "sources", "evidence"):
+                candidate = result.get(field)
+                if isinstance(candidate, list):
+                    values.extend(candidate)
+            if not values and any(
+                key in result for key in ("content", "text", "value", "result", "output")
+            ):
+                values.append(result)
+        elif isinstance(result, str):
+            if result.strip() and not result.lstrip().startswith(("[Browser Error]", "[Browser Warning]")):
+                values.append(result)
+        elif result is not None:
+            values.append(result)
+
+        keys: set[str] = set()
+        for item in values:
+            if isinstance(item, dict):
+                url = str(item.get("canonical_url") or item.get("url") or item.get("pdf_url") or "").strip()
+                content = str(
+                    item.get("source_span") or item.get("content") or item.get("text")
+                    or item.get("snippet") or item.get("summary") or item.get("value")
+                    or item.get("result") or item.get("output") or item.get("title") or ""
+                ).strip()
+                identity = url or content
+            else:
+                identity = str(item).strip()
+            if identity:
+                keys.add(hashlib.sha256(identity.encode("utf-8")).hexdigest())
+        return keys
+
+    async def _execute_tool(self, tool_name: str, args: dict, context: dict | None = None) -> dict:
         """调用具体工具实例。"""
         tool = self.tool_map.get(tool_name)
         if tool is None:
             return {"error": f"Tool '{tool_name}' not found"}
         try:
-            return await tool.execute(**args)
+            fallback_tools = self._fallback_tools(tool_name, args)
+            if tool_name == "web_search" and self.search_controller is not None:
+                return await self.search_controller.execute(
+                    tool,
+                    args,
+                    execution_policy=self.tool_policy,
+                    fallback_tools=fallback_tools,
+                    context=getattr(self, "_active_search_context", None) or context,
+                )
+            return await self.tool_policy.execute(
+                tool_name,
+                tool,
+                args,
+                fallback_tools=fallback_tools,
+            )
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
+
+    def _fallback_tools(self, tool_name: str, args: dict) -> list[tuple[str, Any, dict]]:
+        """Build schema-compatible provider fallbacks when available."""
+        if tool_name == "web_search" and "arxiv_reader" in self.tool_map:
+            return [
+                (
+                    "arxiv_reader",
+                    self.tool_map["arxiv_reader"],
+                    {"query": args.get("query", ""), "max_results": args.get("top_n", 3)},
+                )
+            ]
+        if tool_name == "arxiv_reader" and "web_search" in self.tool_map:
+            return [
+                (
+                    "web_search",
+                    self.tool_map["web_search"],
+                    {"query": args.get("query", ""), "top_n": args.get("max_results", 5)},
+                )
+            ]
+        return []
 
     @staticmethod
     def _normalize_temporal_search_args(args: dict, task: SubTask, context: dict) -> dict:

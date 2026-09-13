@@ -1,0 +1,129 @@
+dataset_id: numeric_challenge_v1
+version: v1
+schema_version: 2
+description: >-
+  Challenge fixture for deterministic numeric claim verification. Development
+  records are public and held-out records are stored separately so an evaluator
+  can expose only aggregate held-out metrics.
+record_schema: numeric_claim_v2
+claim_types:
+  - number
+  - percentage
+  - currency
+  - date
+  - fiscal_year
+labels:
+  - supported
+  - contradicted
+  - unknown
+failure_types:
+  - irrelevant_number
+  - multi_entity_alignment
+  - unit_missing_or_conversion
+  - equivalent_numeric_expression
+  - date_fiscal_year
+  - currency_scale_or_currency_mismatch
+  - source_conflict
+  - derived_percentage
+files:
+  development:
+    path: numeric_challenge_v1_development.jsonl
+    count: 48
+    sha256: 22925fea138bcb555bea7ceae20e6d982832b0d513c2014e236c2568a2dc0e0b
+  held_out:
+    path: private/numeric_challenge_v1_held_out.jsonl
+    count: 24
+    sha256: 6a00a7afa473fbfa5ecaf3f432533f29220aab7feb5b7bbdb4b3efbf32b87814
+splits:
+  miner: []
+  development:
+    - irrelevant_number_dev_supported_01
+    - irrelevant_number_dev_contradicted_01
+    - irrelevant_number_dev_unknown_01
+    - irrelevant_number_dev_supported_02
+    - irrelevant_number_dev_contradicted_02
+    - irrelevant_number_dev_unknown_02
+    - multi_entity_alignment_dev_supported_01
+    - multi_entity_alignment_dev_contradicted_01
+    - multi_entity_alignment_dev_unknown_01
+    - multi_entity_alignment_dev_supported_02
+    - multi_entity_alignment_dev_contradicted_02
+    - multi_entity_alignment_dev_unknown_02
+    - unit_missing_or_conversion_dev_supported_01
+    - unit_missing_or_conversion_dev_contradicted_01
+    - unit_missing_or_conversion_dev_unknown_01
+    - unit_missing_or_conversion_dev_supported_02
+    - unit_missing_or_conversion_dev_contradicted_02
+    - unit_missing_or_conversion_dev_unknown_02
+    - equivalent_numeric_expression_dev_supported_01
+    - equivalent_numeric_expression_dev_contradicted_01
+    - equivalent_numeric_expression_dev_unknown_01
+    - equivalent_numeric_expression_dev_supported_02
+    - equivalent_numeric_expression_dev_contradicted_02
+    - equivalent_numeric_expression_dev_unknown_02
+    - date_fiscal_year_dev_supported_01
+    - date_fiscal_year_dev_contradicted_01
+    - date_fiscal_year_dev_unknown_01
+    - date_fiscal_year_dev_supported_02
+    - date_fiscal_year_dev_contradicted_02
+    - date_fiscal_year_dev_unknown_02
+    - currency_scale_or_currency_mismatch_dev_supported_01
+    - currency_scale_or_currency_mismatch_dev_contradicted_01
+    - currency_scale_or_currency_mismatch_dev_unknown_01
+    - currency_scale_or_currency_mismatch_dev_supported_02
+    - currency_scale_or_currency_mismatch_dev_contradicted_02
+    - currency_scale_or_currency_mismatch_dev_unknown_02
+    - source_conflict_dev_supported_01
+    - source_conflict_dev_contradicted_01
+    - source_conflict_dev_unknown_01
+    - source_conflict_dev_supported_02
+    - source_conflict_dev_contradicted_02
+    - source_conflict_dev_unknown_02
+    - derived_percentage_dev_supported_01
+    - derived_percentage_dev_contradicted_01
+    - derived_percentage_dev_unknown_01
+    - derived_percentage_dev_supported_02
+    - derived_percentage_dev_contradicted_02
+    - derived_percentage_dev_unknown_02
+  held_out:
+    - hc_001
+    - hc_002
+    - hc_003
+    - hc_004
+    - hc_005
+    - hc_006
+    - hc_007
+    - hc_008
+    - hc_009
+    - hc_010
+    - hc_011
+    - hc_012
+    - hc_013
+    - hc_014
+    - hc_015
+    - hc_016
+    - hc_017
+    - hc_018
+    - hc_019
+    - hc_020
+    - hc_021
+    - hc_022
+    - hc_023
+    - hc_024
+split_counts:
+  development: 48
+  held_out: 24
+label_counts:
+  development:
+    supported: 16
+    contradicted: 16
+    unknown: 16
+  held_out:
+    supported: 8
+    contradicted: 8
+    unknown: 8
+isolation:
+  development_public: true
+  held_out_private: true
+  held_out_exposes_row_labels: false
+  evaluator_output: aggregate_only

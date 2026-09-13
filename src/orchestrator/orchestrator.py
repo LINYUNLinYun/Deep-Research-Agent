@@ -14,7 +14,9 @@ Deep Research Agent — 核心编排器 (M1: Multi-Agent Orchestrator)
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
+from dataclasses import replace
 from typing import Any, Callable
 
 from .schemas import (
@@ -25,6 +27,8 @@ from .schemas import (
     ResearchReport,
     RunConfig,
     TaskType,
+    ResearchState,
+    DecisionRecord,
 )
 from .agent_pool import AgentPool
 from ..planner.dag import DAG
@@ -59,6 +63,7 @@ class Orchestrator:
         adversarial_loop: Any | None = None,
         memory_store: Any | None = None,
         summarizer_policy: Any | None = None,
+        evidence_verifier: Any | None = None,
     ) -> None:
         self.planner = planner
         self.agent_pool = agent_pool
@@ -67,6 +72,7 @@ class Orchestrator:
         self.adversarial_loop = adversarial_loop
         self.memory_store = memory_store
         self.summarizer_policy = summarizer_policy
+        self.evidence_verifier = evidence_verifier
 
         # 运行时状态（保留 dict 作为快速缓存，M4 提供持久化 + 语义检索）
         self._memory_store: dict[str, Any] = {}
@@ -80,6 +86,11 @@ class Orchestrator:
         self._start_time: float = 0.0
         self._replan_count: int = 0
         self._adversarial_count: int = 0
+        self._decision_trace: list[DecisionRecord] = []
+        self._seen_evidence: set[str] = set()
+        self._low_novelty_rounds: int = 0
+        self._pending_replan_reason: str = ""
+        self._reusable_results: dict[str, AgentResult] = {}
 
         # 状态机处理器映射
         self._state_handlers: dict[OrchestratorState, Callable[[], asyncio.Future[OrchestratorState]]] = {
@@ -114,6 +125,11 @@ class Orchestrator:
         self._start_time = time.monotonic()
         self._replan_count = 0
         self._adversarial_count = 0
+        self._decision_trace.clear()
+        self._seen_evidence.clear()
+        self._low_novelty_rounds = 0
+        self._pending_replan_reason = ""
+        self._reusable_results.clear()
         self._memory_store.clear()
         self._results.clear()
         self._historical_results.clear()
@@ -125,13 +141,9 @@ class Orchestrator:
         while self._current_state not in (OrchestratorState.DONE, OrchestratorState.FAILED):
             # 全局超时检查
             if self._is_global_timeout():
-                if self._current_state in (
-                    OrchestratorState.COLLECTING,
-                    OrchestratorState.SYNTHESIZING,
-                    OrchestratorState.ADVERSARIAL,
-                ):
-                    # 强制合成：用已有结果生成报告
-                    self._current_state = OrchestratorState.SYNTHESIZING
+                if self._results or self._historical_results:
+                    self._force_synthesize_from_partial("global_timeout")
+                    self._current_state = OrchestratorState.DONE
                 else:
                     self._current_state = OrchestratorState.FAILED
                 break
@@ -153,6 +165,7 @@ class Orchestrator:
                 report = ResearchReport(query=query, content="Report generation failed unexpectedly.")
             report.num_replan = self._replan_count
             report.adversarial_rounds = self._adversarial_count
+            report.decision_trace = [record.to_dict() for record in self._decision_trace]
 
             # M4: 将最终报告存入 SharedMemoryStore
             if self.memory_store is not None:
@@ -255,11 +268,40 @@ class Orchestrator:
                             output=f"SubTask '{task_id}' not found in task_map",
                         )
 
+                    signature = self._task_signature(subtask)
+                    reusable = self._reusable_results.get(signature)
+                    if reusable is not None and reusable.status == AgentStatus.SUCCESS:
+                        return replace(
+                            reusable,
+                            task_id=task_id,
+                            trajectory=list(reusable.trajectory) + [{
+                                "event": "reused",
+                                "signature": signature,
+                                "original_task_id": reusable.task_id,
+                            }],
+                        )
+
+                    missing = []
+                    for dep_id in subtask.dependencies:
+                        dep = self._memory_store.get(f"result:{dep_id}")
+                        if dep is None or dep.status != AgentStatus.SUCCESS:
+                            missing.append(dep_id)
+                    if missing:
+                        return AgentResult(
+                            task_id=task_id,
+                            status=AgentStatus.FAILED,
+                            output=f"Blocked by failed or missing dependencies: {', '.join(missing)}",
+                            trajectory=[{"event": "dependency_blocked", "dependencies": missing}],
+                        )
+
                     # 准备上下文：先执行依赖任务的结果
                     context = self._build_task_context(subtask)
 
                     # 获取 Agent
                     agent = await self.agent_pool.get_agent(subtask.task_type)
+                    route_trace = getattr(agent.policy, "decision_trace", [])
+                    route_start = len(route_trace) if isinstance(route_trace, list) else 0
+                    result: AgentResult | None = None
                     try:
                         # 设置单任务超时
                         result = await asyncio.wait_for(
@@ -279,9 +321,47 @@ class Orchestrator:
                             output=f"Exception: {type(e).__name__}: {e}",
                         )
                     finally:
+                        route_trace = getattr(agent.policy, "decision_trace", [])
+                        if result is not None and isinstance(route_trace, list):
+                            for route in route_trace[route_start:]:
+                                if isinstance(route, dict):
+                                    result.trajectory.append({"event": "model_route", **route})
+                                    self._decision_trace.append(DecisionRecord(
+                                        action="model_route",
+                                        signals={"task_id": task_id, **route},
+                                        model=str(route.get("backend", "")),
+                                        latency=float(route.get("latency", 0.0) or 0.0),
+                                        reason=str(route.get("status", "")),
+                                        timestamp=time.time(),
+                                    ))
+                        if result is not None:
+                            for event in result.trajectory:
+                                if not isinstance(event, dict) or event.get("role") != "tool":
+                                    continue
+                                payload = event.get("result")
+                                policy_record = payload.get("_search_policy") if isinstance(payload, dict) else None
+                                if not isinstance(policy_record, dict):
+                                    continue
+                                artifact = dict(policy_record.get("artifact", {}) or {})
+                                self._decision_trace.append(DecisionRecord(
+                                    action=str(policy_record.get("action", "search_policy")),
+                                    signals={
+                                        "task_id": task_id,
+                                        "decision_point": policy_record.get("decision_point", "after_search"),
+                                        "rule_id": policy_record.get("rule_id", ""),
+                                        "policy_signals": policy_record.get("signals", {}),
+                                        "artifact": artifact,
+                                    },
+                                    reason=str(policy_record.get("reason", "")),
+                                    timestamp=time.time(),
+                                ))
                         await self.agent_pool.release_agent(agent)
 
-                    return result
+                    return result or AgentResult(
+                        task_id=task_id,
+                        status=AgentStatus.FAILED,
+                        output="Agent execution was cancelled before producing a result",
+                    )
 
             # 并发执行本层
             coros = [_run_one(tid) for tid in group]
@@ -299,6 +379,14 @@ class Orchestrator:
                 else:
                     all_results.append(lr)
 
+            # Commit at the layer barrier. This is the crucial DAG data-flow
+            # invariant: the next layer can now consume its predecessors.
+            for result in all_results[-len(layer_results):]:
+                self._memory_store[f"result:{result.task_id}"] = result
+                subtask = self._task_map.get(result.task_id)
+                if subtask is not None and result.status == AgentStatus.SUCCESS:
+                    self._reusable_results[self._task_signature(subtask)] = result
+
         self._results = all_results
         return OrchestratorState.COLLECTING
 
@@ -313,6 +401,7 @@ class Orchestrator:
         # 将结果写入运行时 memory dict
         for r in self._results:
             self._memory_store[f"result:{r.task_id}"] = r
+            self.budget_tracker.track(max(0, int(getattr(r, "token_usage", 0))))
 
         # M4: 将成功结果同步写入 SharedMemoryStore（持久化 + 向量索引）
         if self.memory_store is not None:
@@ -331,15 +420,16 @@ class Orchestrator:
         else:
             print()
 
+        decision = self._decide_after_collection(self._results)
         print(
             f"[Replan] trigger check: failed_count={fail_count}, "
             f"replan_enabled={self._config.max_replan_rounds > 0}, "
             f"current_replans={self._replan_count}, max_replans={self._config.max_replan_rounds}, "
-            f"decision={self._should_replan(self._results)}, failed={failed_ids}"
+            f"decision={decision.action}, failed={failed_ids}"
         )
 
         # 检查是否需要重规划
-        if self._should_replan(self._results):
+        if decision.action == "replan":
             if self._replan_count < self._config.max_replan_rounds:
                 self._replan_count += 1
                 return OrchestratorState.REPLANNING
@@ -358,8 +448,9 @@ class Orchestrator:
             # 延迟导入避免循环依赖
             from src.memory.long_term import MemoryEntry
             claim_text = str(result.output)[:500]  # 取前 500 字作为 claim
+            session = getattr(self.memory_store, "session_id", "")
             entry = MemoryEntry(
-                entry_id=result.task_id,
+                entry_id=f"{session}:{result.task_id}:{int(time.time() * 1000)}",
                 claim=claim_text,
                 source=f"task:{result.task_id}",
                 confidence=getattr(result, "confidence", 0.5),
@@ -371,6 +462,8 @@ class Orchestrator:
                 metadata={
                     "status": result.status.value,
                     "token_usage": getattr(result, "token_usage", 0),
+                    "sources": self._extract_sources(result),
+                    "verification_status": "unverified",
                 },
             )
             self.memory_store.put(entry)
@@ -391,16 +484,29 @@ class Orchestrator:
         context = {
             "query": self._query,
             "results": self._historical_results + self._results,
+            "prior_report": self._memory_store.get("prior_report"),
         }
+        # Source provenance is collected from canonical trajectories before
+        # any L3 aggregation. Compression may change the model-facing text but
+        # must never change the citation/evidence catalog.
+        from ..evidence import EvidenceLedger
+        context["source_catalog"] = EvidenceLedger().catalog(context["results"])
 
-        agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
-        # 需要 SummarizerAgent，但 agent_pool 可能返回 ResearcherAgent
-        # 这里我们通过类型检查或强制创建 SummarizerAgent
+        # Synthesis has a dedicated policy and should not borrow/leak a worker
+        # from the analyze pool.
         from ..agents.summarizer import SummarizerAgent
-        if not isinstance(agent, SummarizerAgent):
-            # 优先使用配置的 summarizer_policy（更大的 max_tokens），fallback 到 agent.policy
-            policy = self.summarizer_policy or agent.policy
-            agent = SummarizerAgent(name="summarizer", policy=policy, tools=agent.tools)
+        policy = self.summarizer_policy
+        if policy is None:
+            borrowed = await self.agent_pool.get_agent(TaskType.ANALYZE)
+            policy = borrowed.policy
+            tools = borrowed.tools
+            await self.agent_pool.release_agent(borrowed)
+        else:
+            tools = []
+        agent = SummarizerAgent(name="summarizer", policy=policy, tools=tools)
+
+        if self.compressor is not None:
+            context["results"] = self._compress_results_for_context(context["results"])
 
         try:
             result = await asyncio.wait_for(
@@ -419,8 +525,6 @@ class Orchestrator:
                 status=AgentStatus.FAILED,
                 output=f"Synthesis error: {type(e).__name__}: {e}",
             )
-        finally:
-            await self.agent_pool.release_agent(agent)
 
         if result.status == AgentStatus.SUCCESS and isinstance(result.output, ResearchReport):
             self._memory_store["final_report"] = result.output
@@ -435,6 +539,36 @@ class Orchestrator:
                     for r in (self._historical_results + self._results)
                 ),
             )
+
+        verification_summary = await self._verify_report_evidence(
+            self._memory_store["final_report"]
+        )
+        if (
+            verification_summary
+            and verification_summary.get("unsupported_rate", 0.0)
+            >= self._config.evidence_replan_threshold
+            and self._config.enable_replan
+            and self._replan_count < self._config.max_replan_rounds
+        ):
+            targeted_tasks = self._prepare_evidence_gap_tasks(verification_summary)
+            if targeted_tasks:
+                self._replan_count += 1
+            self._decision_trace.append(DecisionRecord(
+                action="targeted_verify" if targeted_tasks else "synthesize",
+                signals={
+                    **verification_summary,
+                    "targeted_task_ids": targeted_tasks,
+                },
+                reason=(
+                    "unsupported claims scheduled as a bounded verification DAG"
+                    if targeted_tasks
+                    else "no actionable unresolved claims; skip broad replan"
+                ),
+                timestamp=time.time(),
+            ))
+            if targeted_tasks:
+                self._memory_store["prior_report"] = self._memory_store["final_report"]
+                return OrchestratorState.DISPATCHING
 
         if self._config.enable_adversarial:
             print("[Synthesize] ✓ 报告合成完成，进入对抗优化")
@@ -453,8 +587,8 @@ class Orchestrator:
             return OrchestratorState.DONE
 
         # 置信度足够高时跳过对抗
-        if report.confidence >= 0.8:
-            print("[Adversarial] ✓ 报告置信度已达标 (≥0.8)，跳过对抗优化")
+        if report.confidence >= self._config.adversarial_confidence_threshold:
+            print("[Adversarial] ✓ 报告置信度达到动态配置阈值，跳过对抗优化")
             report.adversarial_status = "skipped"
             report.adversarial_reason = "report_confidence_above_threshold"
             return OrchestratorState.DONE
@@ -467,13 +601,25 @@ class Orchestrator:
 
         try:
             print(f"[Adversarial] ▶ 启动 Red-Blue 对抗优化 (当前置信度={report.confidence:.2f})")
-            optimized_report, history = await self.adversarial_loop.run(report)
+            elapsed = time.monotonic() - self._start_time
+            remaining_global = self._config.global_timeout_seconds - elapsed
+            timeout = min(self._config.adversarial_timeout_seconds, remaining_global)
+            if timeout <= 0:
+                raise asyncio.TimeoutError("global timeout reached before adversarial stage")
+            optimized_report, history = await asyncio.wait_for(
+                self.adversarial_loop.run(report), timeout=timeout
+            )
             self._memory_store["final_report"] = optimized_report
             self._adversarial_count += len(history)
-            if getattr(optimized_report, "adversarial_status", "success") == "skipped":
+            if getattr(optimized_report, "adversarial_status", "success") in {"skipped", "failed", "rejected"}:
                 print(f"[Adversarial] SKIPPED: {optimized_report.adversarial_reason}")
             else:
                 print(f"[Adversarial] ✓ 对抗优化完成: {len(history)} 轮, 最终置信度={optimized_report.confidence:.2f}")
+        except asyncio.TimeoutError:
+            report.adversarial_status = "skipped"
+            report.adversarial_reason = "adversarial_timeout"
+            report.adversarial_rounds = 0
+            print("[Adversarial] SKIPPED: adversarial_timeout，使用原始报告")
         except Exception as e:
             report.adversarial_status = "skipped"
             report.adversarial_reason = str(e)
@@ -494,15 +640,24 @@ class Orchestrator:
                 if st:
                     failed_tasks.append(st)
 
-        reason = self._build_failure_reason(self._results)
+        reason = self._pending_replan_reason or self._build_failure_reason(self._results)
+        self._pending_replan_reason = ""
         print(f"[Replan] Round {self._replan_count}/{self._config.max_replan_rounds}. Failed tasks: {[t.task_id for t in failed_tasks]}")
+
+        all_existing_results = self._historical_results + self._results
+        usable_confidences = [
+            r.confidence for r in all_existing_results
+            if r.status == AgentStatus.SUCCESS
+        ]
+        preserve_threshold = self._adaptive_preserve_threshold(usable_confidences)
 
         try:
             new_dag = self.planner.replan(
                 query=self._query,
                 failed_tasks=failed_tasks,
-                existing_results=self._results,
+                existing_results=all_existing_results,
                 reason=reason,
+                preserve_threshold=preserve_threshold,
             )
             self._dag = new_dag
             self._task_map = self.planner.get_task_map_from_dag(self._dag, self.planner._last_raw_json)
@@ -548,13 +703,72 @@ class Orchestrator:
         策略：任何明确失败/超时的子任务都触发有限重规划；上限由
         RunConfig 控制，避免局部失败静默进入最终报告。
         """
-        if not results:
-            return False
-        total = len(results)
-        failed = sum(1 for r in results if r.status in (AgentStatus.FAILED, AgentStatus.TIMEOUT))
-        success = sum(1 for r in results if r.status == AgentStatus.SUCCESS)
+        return self._decide_after_collection(results, record=False).action == "replan"
 
-        return failed > 0
+    def _decide_after_collection(
+        self, results: list[AgentResult], record: bool = True
+    ) -> DecisionRecord:
+        total = len(results)
+        failed_results = [r for r in results if r.status != AgentStatus.SUCCESS]
+        successes = [r for r in results if r.status == AgentStatus.SUCCESS]
+        failure_ratio = len(failed_results) / max(total, 1)
+        new_keys = self._evidence_keys(successes) - self._seen_evidence
+        novelty = len(new_keys) / max(len(successes), 1)
+        if record:
+            self._seen_evidence.update(new_keys)
+            if successes and novelty < self._config.replan_min_novelty:
+                self._low_novelty_rounds += 1
+            else:
+                self._low_novelty_rounds = 0
+
+        critical_failures = [
+            r.task_id for r in failed_results
+            if self._dag is not None and bool(self._dag.get_successors(r.task_id))
+        ]
+        usable = [r for r in successes if r.confidence >= self._config.min_usable_confidence]
+        remaining = max(0, self._config.token_budget - self.budget_tracker.get_usage())
+        state = ResearchState(
+            coverage=len(successes) / max(total, 1),
+            evidence_novelty=novelty,
+            failures=[{"task_id": r.task_id, "status": r.status.value, "error": str(r.output)[:240]} for r in failed_results],
+            remaining_budget=remaining,
+            successful_tasks=len(successes),
+            total_tasks=total,
+        )
+
+        should_replan = (
+            self._config.enable_replan
+            and bool(failed_results)
+            and remaining > 0
+            and (
+                failure_ratio >= self._config.replan_failure_ratio
+                or bool(critical_failures)
+                or not usable
+            )
+            and self._low_novelty_rounds < self._config.replan_novelty_patience
+        )
+        action = "replan" if should_replan else "synthesize"
+        reason = (
+            "failed tasks affect coverage or downstream dependencies"
+            if should_replan
+            else "evidence is usable, marginal gain is low, or replan budget is disabled"
+        )
+        decision = DecisionRecord(
+            action=action,
+            signals={
+                "coverage": state.coverage,
+                "failure_ratio": failure_ratio,
+                "critical_failures": critical_failures,
+                "evidence_novelty": novelty,
+                "low_novelty_rounds": self._low_novelty_rounds,
+                "remaining_budget": remaining,
+            },
+            reason=reason,
+            timestamp=time.time(),
+        )
+        if record:
+            self._decision_trace.append(decision)
+        return decision
 
     # ------------------------------------------------------------------
     # 辅助方法
@@ -616,7 +830,232 @@ class Orchestrator:
             dep_key = f"result:{dep_id}"
             if dep_key in self._memory_store:
                 ctx[f"dep:{dep_id}"] = self._memory_store[dep_key]
+        if self.compressor is not None:
+            compressible = [
+                f"{key}: {value.output if isinstance(value, AgentResult) else value}"
+                for key, value in ctx.items()
+                if key.startswith("dep:") or key in subtask.context_keys
+            ]
+            if compressible:
+                try:
+                    ctx["compressed_context"] = "\n".join(
+                        self.compressor.compress(compressible, query=subtask.description)
+                    )
+                except Exception as exc:
+                    print(f"[M3] Worker context compression failed: {exc}")
         return ctx
+
+    def _compress_results_for_context(self, results: list[AgentResult]) -> list[AgentResult]:
+        """Compress synthesis inputs without mutating canonical AgentResults."""
+        texts = [str(r.output) for r in results]
+        if not texts:
+            return results
+        try:
+            compressed = self.compressor.compress(texts, query=self._query)
+        except Exception as exc:
+            print(f"[M3] Synthesis compression failed: {exc}")
+            return results
+        # L3 may aggregate many inputs into one. In that case preserve it as a
+        # synthetic evidence result rather than silently misaligning task IDs.
+        if len(compressed) != len(results):
+            return [AgentResult(
+                task_id="compressed_evidence",
+                status=AgentStatus.SUCCESS,
+                output="\n\n".join(compressed),
+                confidence=min((r.confidence for r in results if r.status == AgentStatus.SUCCESS), default=0.5),
+            )]
+        return [replace(result, output=text) for result, text in zip(results, compressed)]
+
+    @staticmethod
+    def _task_signature(task: SubTask) -> str:
+        """Identity used to reuse an unchanged successful task after replan."""
+        material = "\n".join([
+            task.task_type.value,
+            " ".join(task.description.lower().split()),
+            task.expected_type,
+            "|".join(sorted(task.search_hints or [])),
+            "|".join(sorted(task.dependencies or [])),
+            "|".join(sorted(task.context_keys or [])),
+        ])
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _extract_sources(result: AgentResult) -> list[dict[str, Any]]:
+        sources: list[dict[str, Any]] = []
+        for step in result.trajectory:
+            payload = step.get("result") if isinstance(step, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            for item in payload.get("results", []) or payload.get("papers", []):
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url") or item.get("pdf_url")
+                if url:
+                    sources.append({
+                        "url": url,
+                        "title": item.get("title", ""),
+                        "snippet": item.get("snippet") or item.get("summary", ""),
+                    })
+        return sources
+
+    def _evidence_keys(self, results: list[AgentResult]) -> set[str]:
+        keys: set[str] = set()
+        for result in results:
+            sources = self._extract_sources(result)
+            if sources:
+                keys.update(source["url"] for source in sources)
+            elif result.output:
+                normalized = " ".join(str(result.output).lower().split())
+                keys.add(hashlib.sha256(normalized.encode("utf-8")).hexdigest())
+        return keys
+
+    def _adaptive_preserve_threshold(self, confidences: list[float]) -> float:
+        if not confidences:
+            return self._config.min_usable_confidence
+        ordered = sorted(confidences)
+        median = ordered[len(ordered) // 2]
+        return round(max(0.4, min(0.75, median - 0.1)), 2)
+
+    def _force_synthesize_from_partial(self, reason: str) -> None:
+        """Deterministic zero-call fallback used once the hard deadline expires."""
+        results = self._historical_results + self._results
+        usable = [r for r in results if r.status == AgentStatus.SUCCESS and r.output]
+        sections = [f"## Partial result: {r.task_id}\n\n{r.output}" for r in usable]
+        confidence = (
+            sum(r.confidence for r in usable) / len(usable) if usable else 0.0
+        )
+        self._decision_trace.append(DecisionRecord(
+            action="force_synthesize",
+            signals={"usable_results": len(usable)},
+            reason=reason,
+            timestamp=time.time(),
+        ))
+        self._memory_store["final_report"] = ResearchReport(
+            query=self._query,
+            content="\n\n".join(sections) or "No usable evidence was collected before timeout.",
+            confidence=round(confidence * 0.7, 2),
+            adversarial_status="skipped",
+            adversarial_reason=reason,
+        )
+
+    async def _verify_report_evidence(self, report: ResearchReport) -> dict[str, Any]:
+        if self.evidence_verifier is None:
+            return {}
+        try:
+            verified = await self.evidence_verifier.verify(report, report.sources)
+            from ..evidence import ClaimEvidenceEdge
+            report.claim_evidence_edges = [
+                ClaimEvidenceEdge(
+                    claim_id=result.claim.claim_id,
+                    source_id=str(evidence.metadata.get("source_id", "")),
+                    relation=result.status.value,
+                    confidence=result.confidence,
+                    reason=result.reason,
+                ).to_dict()
+                for result in verified
+                for evidence in result.evidence
+            ]
+            summary = self.evidence_verifier.summary(verified)
+            summary["unresolved_claims"] = [
+                {
+                    "claim_id": result.claim.claim_id,
+                    "text": result.claim.text,
+                    "status": result.status.value,
+                    "reason": result.reason,
+                    "risk": result.claim.risk,
+                    "source_refs": list(result.claim.source_refs),
+                    "candidate_sources": [
+                        {
+                            "url": evidence.source_url,
+                            "title": evidence.title,
+                            "span": evidence.source_span[:500],
+                        }
+                        for evidence in result.evidence[:3]
+                        if evidence.source_url
+                    ],
+                }
+                for result in verified
+                if result.status.value != "supported"
+            ]
+            report.evidence_verification = summary
+            report.open_questions = list(summary["unresolved_claims"])
+            if summary.get("total_claims", 0):
+                report.confidence = round(
+                    report.confidence
+                    * (0.5 + 0.5 * summary.get("support_rate", 0.0)),
+                    2,
+                )
+            return summary
+        except Exception as exc:
+            self._decision_trace.append(DecisionRecord(
+                action="verification_failed",
+                reason=str(exc),
+                timestamp=time.time(),
+            ))
+            return {}
+
+    def _prepare_evidence_gap_tasks(self, summary: dict[str, Any]) -> list[str]:
+        """Replace a broad evidence-gap replan with a small verification DAG."""
+        unresolved = summary.get("unresolved_claims", [])
+        if not isinstance(unresolved, list):
+            return []
+        actionable = [item for item in unresolved if isinstance(item, dict) and str(item.get("text", "")).strip()]
+        actionable.sort(
+            key=lambda item: (
+                0 if item.get("status") == "contradicted" else 1,
+                0 if item.get("risk") == "high" else 1,
+                str(item.get("claim_id", "")),
+            )
+        )
+        limit = min(
+            len(actionable),
+            max(0, int(self._config.evidence_replan_max_tasks)),
+            max(0, int(self._config.max_sub_questions)),
+        )
+        selected = actionable[:limit]
+        if not selected:
+            return []
+
+        existing_ids = {result.task_id for result in self._historical_results}
+        self._historical_results.extend(
+            result
+            for result in self._results
+            if result.status == AgentStatus.SUCCESS and result.task_id not in existing_ids
+        )
+        self._results = []
+        self._memory_store["unresolved_claims"] = [item["text"] for item in selected]
+
+        dag = DAG()
+        task_map: dict[str, SubTask] = {}
+        for index, item in enumerate(selected, 1):
+            task_id = f"verify_gap_r{self._replan_count + 1}_{index}"
+            claim_text = str(item["text"]).strip()
+            candidate_sources = item.get("candidate_sources", [])
+            source_lines = [
+                f"- {source.get('url', '')}: {str(source.get('span', ''))[:240]}"
+                for source in candidate_sources
+                if isinstance(source, dict) and source.get("url")
+            ]
+            source_context = "\n".join(source_lines) or "- 当前没有可定位来源，需要做一次精确检索。"
+            dag.add_node(task_id)
+            task_map[task_id] = SubTask(
+                task_id=task_id,
+                task_type=TaskType.VERIFY,
+                description=(
+                    f"claim_id={item.get('claim_id', task_id)}。围绕原始研究问题“{self._query}”，只核验以下结论：{claim_text}。"
+                    "优先用 browser 打开下列候选原文，再按需检索官方、论文或一手来源：\n"
+                    f"{source_context}\n"
+                    "逐项给出数值、单位、日期和可追溯 URL；"
+                    "若证据不足，明确标记 unknown，不要扩展到无关主题。"
+                ),
+                context_keys=["unresolved_claims"],
+                expected_type="factual",
+                search_hints=[claim_text[:180], "official primary source"],
+            )
+        self._dag = dag
+        self._task_map = task_map
+        print(f"[Replan] Evidence gaps converted to targeted verify tasks: {list(task_map)}")
+        return list(task_map)
 
     def _build_failure_reason(self, results: list[AgentResult]) -> str:
         """分析失败原因，生成给 replanner 的描述。"""

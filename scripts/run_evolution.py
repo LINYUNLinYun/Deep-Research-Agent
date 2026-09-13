@@ -3,15 +3,15 @@
 """
 scripts/run_evolution.py
 ================================================================================
-自进化训练脚本
+Legacy 自进化数据准备脚本
 
 功能：
-    1. 启动 M6 Self-Evolution Engine 的 MAE（Multi-Agent Evolution）三角训练循环
-    2. 每轮保存模型 checkpoint
-    3. 记录训练曲线（奖励、KL 散度、损失等）到 JSONL
+    1. 启动 M6 MAE（Multi-Agent Evolution）轨迹生成与评分循环
+    2. 每轮保存 parquet 训练数据
+    3. 当前未接入 GRPO trainer；必须显式传入 --prepare-data-only
 
 Usage:
-    python run_evolution.py --config configs/evolution/grpo_online.yaml
+    python run_evolution.py --prepare-data-only --config configs/evolution/grpo_online.yaml
 ================================================================================
 """
 
@@ -92,7 +92,9 @@ def initialize_evolution(config: dict) -> Any:
     # 初始化 Self-Evolution Engine
     from src.evolution.engine import SelfEvolutionEngine
 
-    trainer_config = config.get("trainer", {})
+    # The shipped GRPO configuration uses ``training``.  Keep ``trainer`` as a
+    # backwards-compatible alias for older local configs.
+    trainer_config = config.get("training", config.get("trainer", {}))
     output_dir = config.get("logging", {}).get("output_dir", "./evolution_output")
     engine = SelfEvolutionEngine(
         proposer=proposer,
@@ -140,7 +142,18 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="日志级别",
     )
+    parser.add_argument(
+        "--prepare-data-only",
+        action="store_true",
+        help="仅运行 legacy 轨迹/奖励数据准备；当前版本尚未接入 GRPO trainer",
+    )
     args = parser.parse_args()
+
+    if not args.prepare_data_only:
+        parser.error(
+            "legacy GRPO trainer 尚未接入，拒绝伪装成训练成功；"
+            "如只需生成轨迹数据，请显式传入 --prepare-data-only"
+        )
 
     setup_logging(args.log_level)
     logger = logging.getLogger("main")
@@ -160,7 +173,7 @@ def main() -> None:
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
-        logger.info(f"自进化完成！汇总已保存: {summary_path}")
+        logger.warning(f"轨迹数据准备完成（未训练模型），汇总已保存: {summary_path}")
         logger.info(f"最终平均得分: {summary.get('final_avg_score', 0.0):.4f}")
 
     except Exception as e:

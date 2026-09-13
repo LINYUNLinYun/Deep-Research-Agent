@@ -167,6 +167,73 @@ class HotpotQABenchmark:
         return text
 
     @staticmethod
+    def extract_answer(report: str) -> str:
+        """Extract a short answer from a Markdown research report.
+
+        ``run_eval`` used to take the first line of a report, which is normally
+        a title such as ``# 研究报告：...``.  Prefer explicit answer/conclusion
+        sections, then fall back to the final body paragraph while ignoring
+        headings and bibliography entries.  The complete report remains stored
+        separately for the depth metrics.
+        """
+        if not report or not report.strip():
+            return ""
+
+        lines = [line.strip() for line in report.splitlines()]
+        lines = [line for line in lines if line and not line.startswith("```")]
+
+        # Inline forms: "答案：清朝" / "Final answer: ...".
+        inline = re.compile(
+            r"^(?:#{0,6}\s*)?(?:最终答案|简短答案|答案|回答|结论|final\s+answer|answer)\s*[:：]\s*(.+)$",
+            re.I,
+        )
+        for line in lines:
+            match = inline.match(line)
+            if match:
+                return HotpotQABenchmark._clean_extracted_answer(match.group(1))
+
+        heading = re.compile(
+            r"^#{1,6}\s*(?:最终答案|简短答案|答案|回答|结论|直接回答|final\s+answer|answer)\s*:?[ \t]*$",
+            re.I,
+        )
+        for index, line in enumerate(lines):
+            if not heading.match(line):
+                continue
+            for candidate in lines[index + 1 :]:
+                if re.match(r"^#{1,6}\s+", candidate):
+                    break
+                if candidate:
+                    return HotpotQABenchmark._clean_extracted_answer(candidate)
+
+        # Last-resort fallback: omit title/reference headings and bibliography
+        # lines, then use the final prose paragraph.  This is deliberately
+        # conservative: EM/F1 should not accidentally score the report title.
+        candidates: list[str] = []
+        in_references = False
+        for line in lines:
+            if re.match(r"^#{1,6}\s*(?:参考来源|参考文献|来源列表|references?|sources?)\s*:?[ \t]*$", line, re.I):
+                in_references = True
+                continue
+            if in_references:
+                continue
+            if re.match(r"^#{1,6}\s*(?:研究报告|research\s+report)", line, re.I):
+                continue
+            if re.match(r"^#{1,6}\s+", line):
+                continue
+            if re.match(r"^(?:[-*]\s*)?(?:\[\d+\]\s*)?(?:https?://|arxiv\.org)", line, re.I):
+                continue
+            candidates.append(line)
+        return HotpotQABenchmark._clean_extracted_answer(candidates[-1] if candidates else "")
+
+    @staticmethod
+    def _clean_extracted_answer(answer: str) -> str:
+        """Remove lightweight Markdown/citation wrappers from an answer."""
+        answer = re.sub(r"^[-*]\s+", "", answer.strip())
+        answer = re.sub(r"\[\d+\]|【\d+】", "", answer)
+        answer = re.sub(r"\s+", " ", answer)
+        return answer.strip(" \t:：")
+
+    @staticmethod
     def exact_match(pred: str, gold: str) -> bool:
         """计算标准化后的精确匹配。"""
         return HotpotQABenchmark.normalize_answer(pred) == HotpotQABenchmark.normalize_answer(gold)

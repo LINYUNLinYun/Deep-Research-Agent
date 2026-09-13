@@ -1,0 +1,45 @@
+artifact_id: search_control_policy
+version: v0001
+parent: null
+description: Conservative post-search control policy for the first immutable production version.
+decision_point: after_search
+parameters:
+  novelty_threshold: 0.25
+  query_similarity_threshold: 0.88
+  max_rewrites: 2
+rules:
+  - id: rewrite_empty_result
+    priority: 200
+    all:
+      - signal: result_count
+        operator: "=="
+        value: 0
+      - signal: remaining_search_budget
+        operator: ">="
+        value: 1
+    action:
+      type: rewrite_uncovered_facets
+    limits:
+      max_activations_per_run: 1
+  - id: rewrite_low_novelty
+    priority: 100
+    all:
+      - signal: evidence_novelty
+        operator: "<"
+        value: 0.25
+      - signal: unresolved_claims
+        operator: ">"
+        value: 0
+      - signal: remaining_search_budget
+        operator: ">="
+        value: 1
+    action:
+      type: rewrite_uncovered_facets
+    limits:
+      max_activations_per_run: 2
+fallback:
+  action:
+    type: accept_results
+hard_limits:
+  max_search_attempts: 10
+  max_total_rewrites: 2

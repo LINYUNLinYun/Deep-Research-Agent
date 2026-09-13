@@ -6,7 +6,7 @@ scripts/run_ablation.py
 消融实验入口脚本（合并了原 run_baseline.py + run_adversarial_ablation.py）。
 
 支持两种消融模式:
-  --mode module : 模块消融 (full / no_adversarial / no_compressor / no_memory / no_evolution)
+  --mode module : 模块消融 (full / no_adversarial / no_compressor / no_memory)
   --mode rounds : 对抗轮数消融 (0/1/2/3 轮)
 
 统计增强:
@@ -36,7 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.core.runner import initialize_modules, load_config, run_research, setup_logging
+from src.core.runner import collect_harness_telemetry, initialize_modules, load_config, run_research, setup_logging
 from src.core.ablation import AblationStudy
 from evaluation.benchmarks.research_bench import ResearchBench
 from evaluation.metrics.rule_based import RuleBasedMetrics
@@ -91,6 +91,7 @@ def run_single_system(
 
     cfg = AblationStudy.override_config(config, overrides)
     modules = initialize_modules(cfg)
+    base_session = getattr(modules.get("memory_store"), "session_id", "")
 
     per_question_scores: dict[str, float] = {}
     details: list[dict[str, Any]] = []
@@ -102,6 +103,8 @@ def run_single_system(
 
         start = time.time()
         try:
+            if modules.get("memory_store") is not None:
+                modules["memory_store"].set_session(f"{base_session}:{system_name}:{qid}")
             report = asyncio.run(run_research(query, cfg, modules))
             elapsed = time.time() - start
             eval_result = evaluate_with_rules(report, qid, bench)
@@ -113,6 +116,7 @@ def run_single_system(
                 "composite_score": composite,
                 "metrics": eval_result["metrics"],
                 "elapsed_seconds": elapsed,
+                "harness": collect_harness_telemetry(modules),
             })
             print(f"    → composite={composite:.3f}, time={elapsed:.1f}s")
         except Exception as e:
@@ -161,10 +165,15 @@ def compute_ablation_stats(
     }
 
 
-def run_module_ablation(config: dict, questions: list[dict[str, Any]], output_dir: str) -> None:
+def run_module_ablation(
+    config: dict,
+    questions: list[dict[str, Any]],
+    output_dir: str,
+    systems: dict[str, tuple[str, dict]] | None = None,
+) -> None:
     """运行模块消融实验，输出统计显著性。"""
     bench = ResearchBench()
-    systems = AblationStudy.DEFAULT_MODULE_ABLATIONS
+    systems = systems or AblationStudy.DEFAULT_MODULE_ABLATIONS
 
     # 跑所有配置
     all_results: dict[str, dict[str, Any]] = {}
@@ -284,11 +293,12 @@ def main() -> None:
         epilog="""
 示例:
   python scripts/run_ablation.py --mode module --questions 10
+  python scripts/run_ablation.py --mode harness --questions 10
   python scripts/run_ablation.py --mode rounds --questions 10 --max_rounds 3
         """,
     )
-    parser.add_argument("--mode", type=str, choices=["module", "rounds"], default="module",
-                        help="消融模式: module=模块消融, rounds=对抗轮数消融")
+    parser.add_argument("--mode", type=str, choices=["module", "harness", "rounds"], default="module",
+                        help="消融模式: module=模块消融, harness=Top3 Harness 消融, rounds=对抗轮数消融")
     parser.add_argument("--questions", type=int, default=10, help="评测题目数量（默认 10）")
     parser.add_argument("--domain", type=str, default=None, choices=["tech", "med", "fin"],
                         help="按领域过滤题目（仅 module 模式）")
@@ -310,6 +320,11 @@ def main() -> None:
 
     if args.mode == "module":
         run_module_ablation(config, questions, args.output_dir)
+    elif args.mode == "harness":
+        run_module_ablation(
+            config, questions, args.output_dir,
+            systems=AblationStudy.HARNESS_ABLATIONS,
+        )
     elif args.mode == "rounds":
         run_rounds_ablation(config, questions, args.max_rounds, args.output_dir)
 

@@ -51,6 +51,11 @@ class ContextCompressor:
         embedder: Optional[Embedder] = None,
         budget: int = 16000,
         output_reserve: int = _OUTPUT_RESERVE,
+        l1_threshold: float = _L1_THRESHOLD,
+        l2_threshold: float = _L2_THRESHOLD,
+        l3_threshold: float = _L3_THRESHOLD,
+        enable_multilevel: bool = True,
+        chars_per_token: float = _CHARS_PER_TOKEN,
     ) -> None:
         """
         初始化上下文压缩器。
@@ -66,6 +71,11 @@ class ContextCompressor:
         self.budget = budget
         self.output_reserve = output_reserve
         self.available_budget = budget - output_reserve
+        self.l1_threshold = max(0.0, min(1.0, float(l1_threshold)))
+        self.l2_threshold = max(self.l1_threshold, min(1.0, float(l2_threshold)))
+        self.l3_threshold = max(self.l2_threshold, min(1.0, float(l3_threshold)))
+        self.enable_multilevel = bool(enable_multilevel)
+        self.chars_per_token = max(1.0, float(chars_per_token))
 
         # 子压缩器
         self.sliding = SlidingWindowCompressor(max_tokens=self.available_budget)
@@ -86,7 +96,7 @@ class ContextCompressor:
             估算 token 数
         """
         total_chars = sum(len(t) for t in texts)
-        return int(total_chars / _CHARS_PER_TOKEN)
+        return int(total_chars / self.chars_per_token)
 
     @trace_chain(name="compressor.compress", tags=["m3", "compressor"])
     def compress(
@@ -110,6 +120,8 @@ class ContextCompressor:
         """
         if not texts:
             return []
+        if not self.enable_multilevel:
+            return texts
 
         # 计算实际可用 budget
         actual_budget = self.available_budget - system_prompt_tokens
@@ -122,11 +134,11 @@ class ContextCompressor:
 
         # 确定压缩级别
         if level is None:
-            if usage_ratio > _L3_THRESHOLD:
+            if usage_ratio > self.l3_threshold:
                 level = 3
-            elif usage_ratio > _L2_THRESHOLD:
+            elif usage_ratio > self.l2_threshold:
                 level = 2
-            elif usage_ratio > _L1_THRESHOLD:
+            elif usage_ratio > self.l1_threshold:
                 level = 1
             else:
                 # 无需压缩
@@ -195,16 +207,20 @@ class ContextCompressor:
             sim = float(query_vec.dot(text_vec)) if text_vec is not None else 0.0
             scored.append((text, sim))
 
-        # 自适应阈值：从 0.25 开始，若不够严格则递减
+        # Rank-and-pack is monotonic: tighter budgets retain fewer, more
+        # relevant documents. The previous decreasing threshold admitted more
+        # documents exactly when the context was already over budget.
+        target_tokens = max(1, int(budget * 0.8))
         best_result: list[str] = []
-        for threshold in [0.25, 0.20, 0.15]:
-            filtered = [t for t, s in scored if s >= threshold]
-            tokens = self.calculate_tokens(filtered)
-            if tokens <= budget * 0.8:
-                best_result = filtered
+        used = 0
+        for text, _score in sorted(scored, key=lambda item: item[1], reverse=True):
+            size = self.calculate_tokens([text])
+            if best_result and used + size > target_tokens:
+                continue
+            best_result.append(text)
+            used += size
+            if used >= target_tokens:
                 break
-            if threshold == 0.15:
-                best_result = filtered
 
         # 保底策略：若过滤后为空但原始有内容，至少保留相似度最高的 1 篇
         if not best_result and texts:

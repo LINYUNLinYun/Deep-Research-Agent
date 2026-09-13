@@ -8,6 +8,8 @@ from .browser import BrowserTool, MockBrowserTool, BaseBrowserTool, get_browser_
 from .file_reader import FileReaderTool
 from .calculator import CalculatorTool
 from .notepad import NotepadTool, NotepadEntry
+from .search_controller import SearchController, SearchControlStats
+from .execution_policy import ToolExecutionPolicy, ToolAttempt, CircuitState
 
 __all__ = [
     # 搜索与阅读
@@ -26,4 +28,9 @@ __all__ = [
     # 辅助
     "NotepadTool",
     "NotepadEntry",
+    "SearchController",
+    "SearchControlStats",
+    "ToolExecutionPolicy",
+    "ToolAttempt",
+    "CircuitState",
 ]

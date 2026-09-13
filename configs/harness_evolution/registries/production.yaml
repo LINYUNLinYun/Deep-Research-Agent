@@ -1,0 +1,12 @@
+schema_version: 1
+artifacts:
+  search_control_policy:
+    version: v0001
+    sha256: 4296b302687a4e392e87f29d812ccccbdfb2bf45e8014366722cb6153315a22b
+    parent: null
+    path: ../policies/search_control_policy/v0001.yaml
+  verify_numeric_claim_skill:
+    version: v0001
+    sha256: f40bd39f77a5335a90bd017a33e7e73d1317a9468982463271fce35407bc3499
+    parent: null
+    path: ../skills/verify_numeric_claim_skill/v0001.yaml

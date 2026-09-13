@@ -1,0 +1,179 @@
+# Cost-controlled profile for Policy/Skill paired evaluation.
+# This is a complete standalone config because runner.load_config() does not
+# merge overlays with configs/default.yaml.
+
+system:
+  name: DeepResearchAgent
+  version: 0.1.0
+  log_level: INFO
+  work_dir: ./outputs
+
+model:
+  backend: deepseek
+  temperature: 0
+  top_p: 1.0
+  max_tokens: 2048
+  max_retries: 3
+  retry_delay: 2.0
+  dynamic_routing:
+    enabled: false
+    candidates:
+      - deepseek
+    failure_cooldown_seconds: 60
+  backend_sampling:
+    deepseek:
+      temperature: 0
+      max_tokens: 4096
+      top_p: 1.0
+    modules:
+      planner:
+        temperature: 0
+        max_tokens: 4096
+        top_p: 1.0
+        thinking: false
+      solver:
+        temperature: 0
+        max_tokens: 4096
+        top_p: 1.0
+        thinking: true
+      summarizer:
+        temperature: 0
+        max_tokens: 16384
+        top_p: 1.0
+        thinking: false
+      red_agent:
+        temperature: 0
+        max_tokens: 4096
+        top_p: 1.0
+        thinking: false
+      blue_agent:
+        temperature: 0
+        max_tokens: 4096
+        top_p: 1.0
+        thinking: false
+      judge:
+        temperature: 0
+        max_tokens: 2048
+        top_p: 1.0
+        thinking: false
+      compressor:
+        temperature: 0
+        max_tokens: 2048
+        top_p: 1.0
+        thinking: false
+  backend_mapping:
+    solver: deepseek
+    planner: deepseek
+    summarizer: deepseek
+    judge: deepseek
+    red_agent: deepseek
+    blue_agent: deepseek
+    compressor: deepseek
+
+orchestrator:
+  max_concurrent: 5
+  global_timeout_seconds: 600
+  max_replan_rounds: 1
+  max_sub_questions: 8
+  max_subagent_retries: 2
+  token_budget: 100000
+
+planner:
+  max_search_rounds_per_subagent: 5
+  enable_replan: true
+  enable_completeness_check: true
+  max_parse_attempts: 3
+  replan_failure_ratio: 0.35
+  replan_min_novelty: 0.08
+  replan_novelty_patience: 1
+  min_usable_confidence: 0.45
+  evidence_replan_threshold: 0.60
+  evidence_replan_max_tasks: 2
+  evidence_gain_threshold: 0.15
+  evidence_gain_patience: 1
+  max_tool_calls_per_subagent: 6
+
+compressor:
+  enabled: true
+  max_context_length: 16000
+  output_reserve_tokens: 2048
+  l1_threshold: 0.6
+  l2_threshold: 0.8
+  l3_threshold: 0.95
+  embedding_model: all-MiniLM-L6-v2
+  enable_multilevel: true
+  chars_per_token: 3.5
+
+memory:
+  enabled: true
+  db_path: data/memory.db
+  max_entries: 10000
+  similarity_threshold_dup: 0.92
+  similarity_threshold_conflict: 0.65
+  evict_interval: 100
+  enable_vector_index: true
+  retrieval_top_k: 10
+  retrieval_min_sim: 0.55
+  recency_half_life_days: 30
+
+adversarial:
+  # Red-Blue is intentionally disabled until its issue/call budgets are fixed.
+  enabled: false
+  max_rounds: 1
+  score_threshold: 9.5
+  delta_threshold: 0.2
+  confidence_gate: 0.8
+  # Numeric Verification remains active before the Red-Blue branch.
+  evidence_verification_enabled: true
+  max_verified_claims: 10
+  evidence_min_overlap: 0.32
+  save_logs: true
+
+evolution:
+  # Legacy GRPO placeholder remains disabled; Harness evolution is separate.
+  enabled: false
+  num_rounds: 20
+  batch_size: 32
+  group_size: 8
+  grpo_steps: 50
+  learning_rate: 5.0e-6
+  kl_coef: 0.01
+  lora_rank: 16
+  judge_ensemble_size: 3
+  held_out_calib_interval: 5
+  symbolic_learning_interval: 3
+
+harness_evolution:
+  enabled: true
+  registry_dir: configs/harness_evolution/registries
+  # Normal/direct runs always resolve production. Candidate evaluation must be
+  # selected explicitly by the offline evolution CLI.
+  registry: production
+
+tools:
+  search_control:
+    enabled: true
+    cache_ttl_seconds: 3600
+    max_cache_entries: 512
+    query_similarity_threshold: 0.82
+    novelty_threshold: 0.15
+    max_rewrites: 1
+  execution:
+    retry_delay: 0.5
+    max_retry_delay: 8.0
+    circuit_failure_threshold: 3
+    circuit_cooldown_seconds: 30
+    timeout_seconds: 30
+  web_search:
+    enabled: true
+    mock_mode: false
+    max_results: 10
+    snippet_max_tokens: 512
+  arxiv_reader:
+    enabled: true
+    max_papers: 5
+    abstract_max_tokens: 1024
+  code_sandbox:
+    enabled: false
+    timeout_seconds: 30
+    memory_limit_mb: 512

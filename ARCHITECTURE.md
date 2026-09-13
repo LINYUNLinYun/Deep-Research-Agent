@@ -12,6 +12,11 @@
 >
 > 目录规模统计：`src/`（核心源码，约 10k 行）+ `evaluation/`（评测，约 2.5k 行）+ `scripts/` + `configs/` ≈ 1.7 万行。
 
+> **Harness 改造（2026-09）**：当前主线已加入共享 `SearchController`、工具
+> retry/fallback/circuit breaker、claim-level `EvidenceVerifier`、状态驱动 replan、
+> evidence-gain stopping、自适应 Memory/Compression 和可选动态模型路由。
+> 核心决策会写入 `ResearchReport.decision_trace`，便于 paired ablation。
+
 ---
 
 ## 1. 系统总览
@@ -83,15 +88,17 @@ Orchestrator.run(query, config)                              # src/orchestrator/
    │  │  DISPATCHING          DAG.get_parallel_groups() 按层；每层 Semaphore+gather 并发
    │  │                       AgentPool.get_agent() ─► ResearcherAgent 多轮 tool-calling
    │  │                       asyncio.wait_for(agent.run(), timeout) 单任务超时
+   │  │                       每层 barrier 后立即提交结果；依赖失败则下游短路
    │  │  DISPATCHING ─► COLLECTING
    │  │  COLLECTING           结果写入运行时 dict + M4 持久化；判断是否需重规划
-   │  │   ├─ 失败率>50% 或 成功<30%且有失败 ─► REPLANNING
-   │  │   │     Planner.replan(失败任务+保留高置信结果) ─► 新 DAG ─► 回 DISPATCHING（≤3 轮）
+   │  │   ├─ 失败比例/依赖影响/证据增益/预算要求补救 ─► REPLANNING
+   │  │   │     Planner.replan(累计结果+动态保留阈值) ─► 新 DAG ─► 回 DISPATCHING
    │  │   └─ 否则 ─► SYNTHESIZING
-   │  │  SYNTHESIZING         SummarizerAgent 汇总所有子结果 ─► ResearchReport
+   │  │  SYNTHESIZING         压缩预算管理 ─► SummarizerAgent ─► ResearchReport
+   │  │                       EvidenceVerifier 做 claim-source 对齐；缺口可补规划
    │  │   ├─ enable_adversarial ─► ADVERSARIAL
    │  │   └─ 否则 ─► DONE
-   │  │  ADVERSARIAL          report.confidence < 0.8 时才运行 Red/Blue 对抗循环
+   │  │  ADVERSARIAL          配置化 gate；Red/Blue 修复后重新评分
    │  │                       ─► DONE
    │  │  DONE / FAILED        终态
    │  └────────────────────────────────────────────────────────────────────────────┘
@@ -164,7 +171,7 @@ ResearcherAgent.run(subtask, context)          # src/agents/researcher.py
 |---|---|---|
 | [runner.py](src/core/runner.py) | `load_config` / `initialize_modules` / `run_research` / `save_report` | **装配根**：加载 YAML → 按 M1~M6 顺序实例化所有模块 → 构造 `RunConfig` 调 `Orchestrator.run` → 把 `ResearchReport` 格式化成带元信息的 Markdown 并落盘 |
 | [judge.py](src/core/judge.py) | `LLMJudge` | 评测用的统一 LLM-as-Judge：`score_single`（单报告 5 维 0-10 分）、`compare_two`（两报告 4 维 head-to-head），JSON 三级解析容错 |
-| [ablation.py](src/core/ablation.py) | `AblationStudy` | 消融实验通用框架：5 个模块开关配置（full / no_adversarial / no_compressor / no_memory / no_evolution）+ 对抗轮数消融 |
+| [ablation.py](src/core/ablation.py) | `AblationStudy` | 消融实验通用框架：4 个有效模块配置（full / no_adversarial / no_compressor / no_memory）+ Harness 专项消融 + 对抗轮数消融 |
 
 `runner.py` 是唯一的"上帝装配点"——所有模块在此按序构造并互相注入，子模块之间基本不直接 import（用延迟导入规避循环依赖）。理解整个项目**从这里开始**。关键装配代码：[runner.py:127-269](src/core/runner.py#L127-L269)。
 
@@ -199,10 +206,10 @@ ResearcherAgent.run(subtask, context)          # src/agents/researcher.py
 - 单任务 `asyncio.wait_for(timeout)`，超时/异常包装成 `AgentResult(status=TIMEOUT/FAILED)` 不中断整体。
 - 依赖任务结果通过 `_build_task_context` 注入子任务上下文。
 
-**三级降级策略**（实际实现）：
+**状态驱动降级策略**（实际实现）：
 1. 单任务超时/失败 → 标记状态继续跑；
-2. 结果**失败率 > 50%** 或 **成功 < 30% 且有失败** → 触发 `REPLANNING`（≤ `max_replan_rounds`）；
-3. **全局超时** → 代码注释称"强制合成"，但实际中断循环后落回 FAILED 分支返回失败文案（见 §10 遗留问题）。
+2. 综合失败比例、依赖影响、可用证据、证据新颖度和剩余预算决定是否 `REPLANNING`；
+3. **全局超时** → 使用已完成的成功结果生成降级报告，并记录 `force_synthesize` 决策。
 
 **对抗门控**：`_do_synthesizing` 完成后若 `enable_adversarial`，进入 `ADVERSARIAL` 态；`_do_adversarial` 仅在**合成报告 `confidence < 0.8`** 时真正跑对抗循环（[orchestrator.py:446](src/orchestrator/orchestrator.py#L446)），分够高就直接跳过。
 
@@ -311,7 +318,7 @@ ShortTermMemory（独立对话历史，⚠️ 当前全项目无调用方）
 
 ---
 
-### 4.8 `src/evolution/` — M6 在线自进化（框架完整，默认未启用）
+### 4.8 `src/evolution/` — M6 旧 GRPO 进化骨架（默认未启用）
 
 **设计目标**（MAE 三角）：`Proposer` 出题 → `Solver`（即整套 DeepResearch Agent）执行 → `Judge` 五维评分 → 产出 `parquet` 喂 **veRL GRPO** 训练，并把经验写回记忆实现越用越强。
 
@@ -319,16 +326,16 @@ ShortTermMemory（独立对话历史，⚠️ 当前全项目无调用方）
 |---|---|---|---|
 | [engine.py](src/evolution/engine.py) | `SelfEvolutionEngine` | 编排一轮轮出题-求解-评分-入库 | ✅ 引擎本身可跑 |
 | [proposer.py](src/evolution/proposer.py) | `Proposer` | 按 L1/L2/L3 难度与成功率生成研究问题，embedding 去重 | ✅ |
-| [judge.py](src/evolution/judge.py) | `Judge` | Ensemble(3视角) 评分 + `shape_reward` 转单值 reward + 校准 | ✅（⚠️ 缩放 bug 见 §10） |
+| [judge.py](src/evolution/judge.py) | `Judge` | Ensemble(3视角) 评分 + `shape_reward` 转单值 reward + 校准 | ✅ |
 | [collector.py](src/evolution/collector.py) | `TrajectoryCollector` | 轨迹收集并转 veRL 标准 parquet 行 | ✅ |
 | [experience_memory.py](src/evolution/experience_memory.py) | `ExperienceMemory` | SQLite 存"问题-轨迹-得分"，embedding 检索 + 综合分淘汰 | ✅ |
 | [symbolic_learning.py](src/evolution/symbolic_learning.py) | `SymbolicLearner` | 从失败轨迹提取错误模式 → LLM 改进 prompt → 变差自动回滚 | ⚠️ 已实现但 `run_evolution.py` 未实例化 |
 
 **关键事实**：
 - `evolution.enabled=false`（[default.yaml:180](configs/default.yaml#L180)），主流程默认不进入进化路径。
-- 唯一入口 [scripts/run_evolution.py](scripts/run_evolution.py)；其中 veRL GRPO **训练调用是占位伪代码**（只建 checkpoint 目录），未真正拉起 veRL trainer。
+- 唯一入口 [scripts/run_evolution.py](scripts/run_evolution.py)；veRL GRPO **训练调用仍未接入**，命令默认拒绝运行，只有显式 `--prepare-data-only` 才执行轨迹与 parquet 数据准备，且不会创建伪 checkpoint。
 - 五维评分（`factual_accuracy .30 / coverage .25 / logical_coherence .20 / citation_quality .15 / efficiency .10`）+ 规则式 `efficiency`（sigmoid 防 reward hacking）。
-- `configs/evolution/grpo_online.yaml` 顶层是 `training:`，而 `run_evolution.py:95` 读的是 `config.get("trainer")`——**key 对不上，该 YAML 实际未生效**；`reward_shaping.yaml` 无任何代码消费。
+- `configs/evolution/grpo_online.yaml` 的 `training:` 已接入 legacy 数据准备参数；`reward_shaping.yaml` 仍无代码消费。
 
 ---
 
@@ -376,6 +383,33 @@ ShortTermMemory（独立对话历史，⚠️ 当前全项目无调用方）
 
 ---
 
+### 4.12 `src/harness_evolution/` — 冻结模型的 Policy / Skill 自进化 V1
+
+这是与 `src/evolution/` 完全隔离的离线外循环。它不训练模型，也不修改 Python 源码，只进化两类经过白名单校验的 YAML 工件：
+
+- `search_control_policy`：控制 `SearchController.after_search` 的 accept/rewrite/switch/verify/stop 决策；
+- `verify_numeric_claim_skill`：组合固定 primitive，保守验证数字、百分比、金额单位、日期和财年 claim。
+
+```text
+运行轨迹 → Failure Miner → LLM 修改假设（可选）
+        → 程序枚举最多 5 个单变量候选 → immutable candidate
+        → frozen replay / held-out paired evaluation
+        → Promotion Gate → 人工 promote 或 reject
+```
+
+关键隔离边界：
+
+- `production.yaml`、`candidate.yaml`、`canary.yaml` 只保存版本指针；工件采用排他创建，读取时校验 SHA-256；
+- 默认配置 `harness_evolution.enabled=false`，启用时仍只读 production，candidate 必须由离线 CLI 显式选择；
+- 每个 paired run 重建 modules、Model、AgentPool、Memory session 和 SearchController；
+- replay 未覆盖请求会硬失败，已录制 timeout/429/5xx 则作为冻结实验条件正常回放；
+- Manifest 固化 config、Git、dataset、fixture、evaluator 与工件版本/hash，不写入最终 Markdown；
+- held-out 数据不能进入 `mine` 或 `propose`，且晋升必须再次校验 decision hash、candidate hash 和 production parent。
+
+入口是 [run_harness_evolution.py](scripts/run_harness_evolution.py)，而不是旧 [run_evolution.py](scripts/run_evolution.py)。当前示例保留 production Skill `v0001`，candidate Skill `v0002`；held-out 结果为 24 tie、无显著提升，因此正确地被拒绝晋升。
+
+---
+
 ## 5. 配置体系（`configs/`）
 
 **真正生效的只有 [configs/default.yaml](configs/default.yaml)**，由 `runner.load_config` 加载。顶层结构：
@@ -420,11 +454,12 @@ ShortTermMemory（独立对话历史，⚠️ 当前全项目无调用方）
 | [run_single.py](scripts/run_single.py) | 单条 query 跑全流程，输出报告（另写 `run_*.log`） |
 | [run_repl.py](scripts/run_repl.py) | 交互式 REPL；`ls/sessions/save/q`；单进程复用 Orchestrator + 记忆，session 可继承/新建 |
 | [run_eval.py](scripts/run_eval.py) | 标准评测：ResearchBench 或 HotpotQA，汇总平均综合分 |
-| [run_ablation.py](scripts/run_ablation.py) | 模块消融（5 配置）与对抗轮数消融（`--mode module/rounds`），带 bootstrap 显著性 |
+| [run_ablation.py](scripts/run_ablation.py) | 模块消融（4 个有效配置）、Harness 专项消融与对抗轮数消融，带 bootstrap 显著性 |
 | [run_benchmark.py](scripts/run_benchmark.py) | **Agent vs 单轮 LLM** head-to-head（A=baseline 单轮 deepseek，B=agent 全流程），4 维配对显著性 |
 | [run_judge.py](scripts/run_judge.py) | 对已有报告文件跑单次 MiMo Judge 深度评分 |
 | [run_all_experiments.py](scripts/run_all_experiments.py) | 批量编排：subprocess 串行跑 7 类实验（约 165 次研究运行），汇总 `SUMMARY.md` |
-| [run_evolution.py](scripts/run_evolution.py) | M6 自进化入口（`--config configs/evolution/grpo_online.yaml`） |
+| [run_evolution.py](scripts/run_evolution.py) | Legacy M6 数据准备入口；需显式 `--prepare-data-only`，当前不执行模型训练 |
+| [run_harness_evolution.py](scripts/run_harness_evolution.py) | 离线 Policy/Skill mine、propose、evaluate、report、人工 promote/rollback |
 | [run_repl.py](scripts/run_repl.py) | 见上 |
 
 > `pyproject.toml` 把这些脚本注册为 CLI（`run-research` / `run-eval` 等），依赖分 `serve`(vllm) / `train` / `dev` / `all` 四级 optional。
@@ -461,6 +496,7 @@ tools/         ← 被 AgentPool(agent 构造) 与 runner 注入
 core.judge  ─► models.model_router（评测用 LLM-Judge）
 evaluation/ ─► core.runner（run_research）+ core.judge + memory.embedder
 evolution/  ─► orchestrator(as Solver) + memory.embedder + orchestrator.schemas
+harness_evolution/ ─► SearchController / EvidenceVerifier + immutable Registry + strict Replay + paired Evaluation
 ```
 
 **隐式接口契约**（跨模块鸭子类型，改模块前先对齐）：
@@ -498,13 +534,13 @@ evolution/  ─► orchestrator(as Solver) + memory.embedder + orchestrator.sche
 
 | # | 位置 | 问题 |
 |---|---|---|
-| B1 | [orchestrator.py:125-135](src/orchestrator/orchestrator.py#L125-L135) | 全局超时注释称"强制合成"，实际设 `SYNTHESIZING` 后直接 `break`，循环退出后因状态非 DONE 而落回 FAILED 分支，**返回失败文案而非合成** |
-| B2 | [evolution/judge.py:273](src/evolution/judge.py#L273) | `shape_reward` 用 `composite*2-1`，但 composite ∈ [0,10]，reward 几乎恒被 clip 到 1.0；应为 `composite/5-1`（engine.py 的 success 映射正是 `/5-1`） |
-| B3 | [run_evolution.py:95](scripts/run_evolution.py#L95) vs [grpo_online.yaml](configs/evolution/grpo_online.yaml) | 代码读 `config.get("trainer")`，YAML 顶层却是 `training:`，key 不匹配 → trainer 配置实际为空 |
+| B1 | [orchestrator.py](src/orchestrator/orchestrator.py) | **已修复**：全局超时时基于已有结果生成降级报告，并记录 `force_synthesize` 决策 |
+| B2 | [evolution/judge.py](src/evolution/judge.py) | **已修复**：`shape_reward` 按 `composite/5-1` 从 `[0,10]` 映射到 `[-1,1]` |
+| B3 | [run_evolution.py](scripts/run_evolution.py) vs [grpo_online.yaml](configs/evolution/grpo_online.yaml) | **已修复**：读取 `training:`，同时保留旧 `trainer:` alias；未接入训练器时默认 fail-fast |
 | B4 | [schemas.py:48](src/orchestrator/schemas.py#L48) + [agent_pool.py](src/orchestrator/agent_pool.py) | `TaskType` 无 `synthesize`，agent_pool 中 `elif type_key=="synthesize"` 是死代码（合成实际由 Orchestrator 手动 new SummarizerAgent） |
-| B5 | planner prompt（硬编码 "3 to 8" / "6-10"）vs `RunConfig.max_sub_questions` | `max_sub_questions` 配置项**未生效**，子任务数量由 prompt 文本决定且两处自述矛盾 |
-| B6 | [researcher.py](src/agents/researcher.py) | system prompt 说"最多 2 次工具调用"，实际 `max_turns=10`，软约束非硬限 |
-| B7 | [agent_pool.py](src/orchestrator/agent_pool.py) | `get_agent(ANALYZE/VERIFY)` 计数键与 `release_agent` 归键（全归 search）不一致 → `get_stats` 漂移 |
+| B5 | [planner.py](src/planner/planner.py) | **已修复**：`max_sub_questions` 注入 Planner，并拒绝重复/空 ID 和未知依赖 |
+| B6 | [researcher.py](src/agents/researcher.py) | 已增加配置化 `max_tool_calls` 硬上限；Prompt 中“2 次”仍是建议值 |
+| B7 | [agent_pool.py](src/orchestrator/agent_pool.py) | **已修复**：Agent 记录原始 pool type，释放时不再全部归入 search |
 | B8 | [short_term.py](src/memory/short_term.py) | `ShortTermMemory` 全项目无调用方（预留） |
 | B9 | [base_agent.py:13](src/agents/base_agent.py#L13) | `TYPE_CHECKING` 下 `from orchestrator.schemas import …` 缺前导点（应为相对导入），仅类型检查报错、运行无碍 |
 | B10 | [runner.py:330](src/core/runner.py#L330) | 无论是否 mock 都调 `WebSearchTool.close_session()`（mock 时用的是 Mock 版） |

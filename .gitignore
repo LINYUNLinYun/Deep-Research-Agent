@@ -213,3 +213,6 @@ htmlcov/
 *.log
 # 保留 outputs 目录下的报告文件，只忽略日志
 outputs/**/*.log
+outputs/evaluation/*
+outputs/harness_evolution/*
+configs/harness_evolution/datasets/private/*.jsonl

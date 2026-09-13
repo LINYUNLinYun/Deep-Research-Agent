@@ -36,10 +36,30 @@ def compute_composite_score(
     }
     w = weights if weights is not None else default_weights
 
+    normalized_rule_metrics = dict(rule_metrics or {})
+    # ResearchBench pre-v1 result files used two factual aliases.  Normalize
+    # them before averaging so historical evaluation artifacts are not scored
+    # as factual_accuracy=0 by this generic aggregator.
+    if "factual_accuracy" not in normalized_rule_metrics:
+        factual_aliases = [
+            value
+            for key, value in normalized_rule_metrics.items()
+            if key in {"factual_accuracy_str", "factual_accuracy_sem"}
+            and isinstance(value, (int, float))
+        ]
+        if factual_aliases:
+            normalized_rule_metrics["factual_accuracy"] = sum(factual_aliases) / len(factual_aliases)
+
     rule_score = 0.0
-    if rule_metrics:
+    if normalized_rule_metrics:
         # 规则指标已经是 0-1 的分数，直接加权平均
-        rule_vals = [v for v in rule_metrics.values() if isinstance(v, (int, float))]
+        # Do not count the alias fields in addition to canonical factual score;
+        # they are alternate views of the same dimension, not extra metrics.
+        rule_vals = [
+            v for key, v in normalized_rule_metrics.items()
+            if key not in {"factual_accuracy_str", "factual_accuracy_sem"}
+            and isinstance(v, (int, float))
+        ]
         rule_score = sum(rule_vals) / len(rule_vals) if rule_vals else 0.0
 
     judge_score = 0.0
@@ -60,6 +80,6 @@ def compute_composite_score(
         "composite_score": round(composite, 4),
         "rule_score": round(rule_score, 4),
         "judge_score": round(judge_score, 4),
-        "rule_metrics": rule_metrics or {},
+        "rule_metrics": normalized_rule_metrics,
         "judge_dimensions": judge_dims,
     }

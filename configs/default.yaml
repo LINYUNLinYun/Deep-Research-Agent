@@ -41,6 +41,11 @@ model:
   max_tokens: 2048
   max_retries: 3
   retry_delay: 2.0
+  # 可选在线路由：candidates 按低成本→高能力排序；复杂任务升级，失败则降级。
+  dynamic_routing:
+    enabled: false
+    candidates: ["mimo", "deepseek"]
+    failure_cooldown_seconds: 60
 
   # ---------------------------------------------------------------------------
   # 【唯一入口】模块级采样参数管理
@@ -86,9 +91,11 @@ model:
       red_agent:
         temperature: 0.1       # 攻击必须严谨，几乎不需要随机性
         max_tokens: 4096
+        thinking: false        # 严格 JSON 输出，避免 reasoning 耗尽输出预算
       blue_agent:
         temperature: 0.3       # 修复需要确定性
         max_tokens: 4096
+        thinking: false        # 修复与 self-verify 都要求严格 JSON
       judge:
         temperature: 0.1       # 评分标准必须一致，避免漂移
         max_tokens: 2048
@@ -105,8 +112,8 @@ model:
     planner: "deepseek"       # 规划器：DeepSeek Flash
     summarizer: "deepseek"    # 合成器：DeepSeek Flash
     judge: "mimo"            # 评分器：Xiaomi MiMo 2.5 Pro
-    red_agent: "mimo"         # 对抗攻击：Xiaomi MiMo 2.5 Pro（OpenAI 兼容）
-    blue_agent: "mimo"        # 对抗修复：Xiaomi MiMo 2.5 Pro
+    red_agent: "deepseek"     # 暂用 DeepSeek；MiMo 凭证恢复并复测后再切回
+    blue_agent: "deepseek"    # 严格 JSON 修复，配合 thinking=false
     compressor: "mimo"        # 上下文压缩：MiMo（摘要任务成本低）
 
 orchestrator:
@@ -121,6 +128,7 @@ orchestrator:
   max_sub_questions: 8
   # 子 Agent 执行失败后的最大重试次数
   max_subagent_retries: 2
+  token_budget: 100000
 
 planner:
   # M2: Adaptive Planner 配置
@@ -130,9 +138,20 @@ planner:
   enable_replan: true
   # 计划执行完成后是否自动进行完整性检查
   enable_completeness_check: true
+  max_parse_attempts: 3
+  replan_failure_ratio: 0.35
+  replan_min_novelty: 0.08
+  replan_novelty_patience: 1
+  min_usable_confidence: 0.45
+  evidence_replan_threshold: 0.60
+  evidence_replan_max_tasks: 3
+  evidence_gain_threshold: 0.15
+  evidence_gain_patience: 1
+  max_tool_calls_per_subagent: 6
 
 compressor:
   # M3: Context Compressor 配置
+  enabled: true
   # 压缩前允许的最大上下文长度（token 数）
   max_context_length: 16000
   # 为输出保留的 token 预算（避免压缩后无法生成回答）
@@ -147,9 +166,11 @@ compressor:
   embedding_model: "all-MiniLM-L6-v2"
   # 是否启用多级压缩（L1-L3）
   enable_multilevel: true
+  chars_per_token: 3.5
 
 memory:
   # M4: Shared Memory Store 配置
+  enabled: true
   # SQLite 数据库文件路径
   db_path: "data/memory.db"
   # 内存表中最大条目数，超过则触发淘汰
@@ -162,17 +183,45 @@ memory:
   evict_interval: 100
   # 是否启用向量化索引（加速相似度检索）
   enable_vector_index: true
+  retrieval_top_k: 10
+  retrieval_min_sim: 0.55
+  recency_half_life_days: 30
 
 adversarial:
   # M5: Red-Blue Adversarial Loop 配置
   # 总开关：是否启用对抗降噪流程
   enabled: true
   # Red-Blue 对抗最大轮数
-  max_rounds: 10
+  max_rounds: 3
+  # 单轮只修复最高优先级问题，限制 Red-Blue 调用放大。
+  max_issues_per_round: 5
+  # Red 每个维度最多输出的问题数；总列表仍按上面的 Top-K 截断。
+  max_issues_per_dimension: 2
+  max_sources: 20
+  # 单项候选失败只回滚该项；连续失败达到此值后才停止本轮。
+  max_consecutive_failures: 2
+  # 补充搜索只向 Blue 暴露少量、可确定绑定引用编号的候选来源。
+  max_candidate_sources: 3
+  # 字符预算（不是 token）：Red 提升到 8k，局部 self-verify 提升到 6k。
+  # Blue 全文盲目扩到 6k/8k 的 live smoke 出现外部指标回归，因此默认维持
+  # 4k，并保留配置入口供后续异构模型和 issue-centered context 实验。
+  red_context_chars: 8000
+  blue_context_chars: 4000
+  self_verify_context_chars: 6000
+  # Red 仅在单维度 JSON 无法解析时重试该维度；后端错误不重试。
+  red_dimension_parse_retries: 1
+  # 对抗阶段同时受此超时和全局剩余时间约束。
+  timeout_seconds: 180
+  red_max_tokens: 4096
+  blue_max_tokens: 4096
   # Blue Agent 输出质量分阈值，达到此分即可提前终止对抗
   score_threshold: 9.5
   # 相邻两轮评分差异阈值，低于此值视为收敛，提前终止
   delta_threshold: 0.2
+  confidence_gate: 0.8
+  evidence_verification_enabled: true
+  max_verified_claims: 50
+  evidence_min_overlap: 0.32
   # 是否保存每轮对抗日志
   # 注意：采样参数已移至 model.backend_sampling.modules，此处不再使用
   save_logs: true
@@ -202,8 +251,30 @@ evolution:
   # 每隔多少轮执行一次符号规则学习
   symbolic_learning_interval: 3
 
+# 冻结模型的离线 Harness 自进化。与上面的 GRPO evolution 相互独立；
+# 默认关闭，启用后仍只加载 production，候选实验必须显式改为 candidate。
+harness_evolution:
+  enabled: false
+  registry_dir: "configs/harness_evolution/registries"
+  registry: "production"
+
 tools:
   # 工具模块全局配置
+  search_control:
+    enabled: true
+    cache_ttl_seconds: 3600
+    max_cache_entries: 512
+    query_similarity_threshold: 0.82
+    novelty_threshold: 0.15
+    max_rewrites: 1
+    # Run-scoped provider hard cap; remains active when Harness Evolution is disabled.
+    max_backend_calls_per_run: 64
+  execution:
+    retry_delay: 0.5
+    max_retry_delay: 8.0
+    circuit_failure_threshold: 3
+    circuit_cooldown_seconds: 30
+    timeout_seconds: 30
   web_search:
     enabled: true
     # mock_mode: 无真实搜索 API 时返回模拟结果，用于快速调试

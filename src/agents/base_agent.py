@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from orchestrator.schemas import SubTask, AgentResult
+    from ..orchestrator.schemas import SubTask, AgentResult
 
 
 __all__ = ["BaseAgent"]

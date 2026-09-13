@@ -416,6 +416,50 @@ class ResearchBench:
         },
     ]
 
+    # CLI/configs historically used English short names while the built-in
+    # dataset stores Chinese labels.  Keep both forms (and common long forms)
+    # accepted so a filtered run never silently evaluates zero questions.
+    DOMAIN_ALIASES: dict[str, str] = {
+        "tech": "科技",
+        "technology": "科技",
+        "科技": "科技",
+        "med": "医疗",
+        "medical": "医疗",
+        "health": "医疗",
+        "医疗": "医疗",
+        "fin": "金融",
+        "finance": "金融",
+        "金融": "金融",
+        "edu": "教育",
+        "education": "教育",
+        "教育": "教育",
+        "law": "法律",
+        "legal": "法律",
+        "法律": "法律",
+        "energy": "能源",
+        "能源": "能源",
+        "consumer": "消费",
+        "消费": "消费",
+        "auto": "汽车",
+        "automotive": "汽车",
+        "汽车": "汽车",
+        "game": "游戏",
+        "gaming": "游戏",
+        "游戏": "游戏",
+        "media": "传媒",
+        "传媒": "传媒",
+        "cross": "交叉",
+        "交叉": "交叉",
+    }
+
+    @classmethod
+    def normalize_domain(cls, domain: str | None) -> str | None:
+        """Return the dataset label for a CLI/config domain alias."""
+        if domain is None:
+            return None
+        normalized = str(domain).strip().lower()
+        return cls.DOMAIN_ALIASES.get(normalized, str(domain).strip())
+
     def __init__(self, data_path: str | None = None) -> None:
         """
         初始化评测集。
@@ -446,7 +490,8 @@ class ResearchBench:
         """
         result = self.questions
         if domain:
-            result = [q for q in result if q.get("domain") == domain]
+            normalized_domain = self.normalize_domain(domain)
+            result = [q for q in result if q.get("domain") == normalized_domain]
         if n is not None:
             result = result[:n]
         return result
@@ -487,7 +532,13 @@ class ResearchBench:
         # bias 维度用 (1 - hallucination_rate) 作为代理
         bias_score = max(0.0, 1.0 - hallucination)
 
+        # Keep the two historical factual sub-metrics for compatibility, but
+        # expose one canonical key consumed by composite_score.  Averaging the
+        # lexical and semantic signals avoids silently treating factual quality
+        # as zero when only aliases are present.
+        factual_accuracy = (factual_str + factual_sem) / 2.0
         metrics = {
+            "factual_accuracy": factual_accuracy,
             "factual_accuracy_str": factual_str,
             "factual_accuracy_sem": factual_sem,
             "logical_consistency": logic,

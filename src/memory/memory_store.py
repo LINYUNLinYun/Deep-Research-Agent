@@ -111,6 +111,14 @@ class SharedMemoryStore:
         db_path: str = "memory.db",
         embedder: Optional[Embedder] = None,
         session_id: str = "",
+        dedup_threshold: float = _DEDUP_THRESHOLD,
+        conflict_low: float = _CONFLICT_LOW,
+        conflict_high: float = _CONFLICT_HIGH,
+        max_entries: int = 10000,
+        evict_interval: int = 100,
+        retrieval_top_k: int = 10,
+        retrieval_min_sim: float = 0.55,
+        recency_half_life_days: float = 30.0,
     ) -> None:
         """
         初始化共享记忆存储。
@@ -123,7 +131,18 @@ class SharedMemoryStore:
         self.lt = LongTermMemory(db_path=db_path)
         self.embedder = embedder or Embedder()
         self._lock = threading.RLock()
-        self.session_id = session_id
+        # Empty sessions used to read/write every historical run. A generated
+        # scope is safer; callers wanting continuity must pass an explicit ID.
+        self.session_id = session_id or f"run-{uuid.uuid4().hex}"
+        self.dedup_threshold = max(0.0, min(1.0, dedup_threshold))
+        self.conflict_low = max(0.0, min(1.0, conflict_low))
+        self.conflict_high = max(self.conflict_low, min(1.0, conflict_high))
+        self.max_entries = max(1, int(max_entries))
+        self.evict_interval = max(1, int(evict_interval))
+        self.retrieval_top_k = max(1, int(retrieval_top_k))
+        self.retrieval_min_sim = max(0.0, min(1.0, retrieval_min_sim))
+        self.recency_half_life_days = max(1.0, float(recency_half_life_days))
+        self._writes_since_evict = 0
 
         # 内存向量索引
         self._entry_ids: list[str] = []
@@ -137,9 +156,16 @@ class SharedMemoryStore:
     # 内部索引管理
     # ------------------------------------------------------------------
 
+    def set_session(self, session_id: str) -> None:
+        """Switch retrieval/write scope and rebuild the in-memory index."""
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        self.session_id = session_id
+        self._rebuild_index()
+
     def _rebuild_index(self) -> None:
         """从 SQLite 重建内存向量索引。若指定了 session_id，只加载该会话数据。"""
-        entries = self.lt.get_all_entries(session_id=self.session_id or None)
+        entries = self.lt.get_all_entries(session_id=self.session_id)
         with self._lock:
             self._entry_ids = [e.entry_id for e in entries]
             self._entries_cache = {e.entry_id: e for e in entries}
@@ -151,7 +177,7 @@ class SharedMemoryStore:
                 self._embeddings = mat / norms
             else:
                 self._embeddings = np.zeros((0, self.embedder.dim), dtype=np.float32)
-        scope = f"session={self.session_id}" if self.session_id else "all sessions"
+        scope = f"session={self.session_id}"
         logger.info(f"Memory index rebuilt: {len(entries)} entries loaded ({scope}).")
 
     def _add_to_index(self, entry: MemoryEntry) -> None:
@@ -230,6 +256,10 @@ class SharedMemoryStore:
             logger.info(f"[M4] Junk entry rejected (conf={entry.confidence:.2f}, len={len(entry.claim)}): {entry.claim[:60]}...")
             return entry.entry_id
 
+        # Scope the entry before duplicate replacement so an updated duplicate
+        # never loses its session_id.
+        entry.session_id = self.session_id
+
         # 2. 确保有 embedding
         if not entry.embedding:
             entry.embedding = self.embedder.encode(entry.claim)
@@ -250,13 +280,17 @@ class SharedMemoryStore:
                 logger.info(f"Duplicate detected, kept existing {duplicate_id}.")
             return duplicate_id
 
-        # 写入 session_id 并持久化
-        entry.session_id = self.session_id
+        # 写入并持久化
         self.lt.insert_entry(entry)
         self._add_to_index(entry)
 
         # 矛盾检测（与新 entry 比较）
         self._detect_conflicts(entry)
+
+        self._writes_since_evict += 1
+        if self._writes_since_evict >= self.evict_interval:
+            self.evict(self.max_entries)
+            self._writes_since_evict = 0
 
         return entry.entry_id
 
@@ -278,7 +312,7 @@ class SharedMemoryStore:
             sims = self._embeddings.dot(vec)
         best_idx = int(np.argmax(sims))
         best_sim = float(sims[best_idx])
-        if best_sim > _DEDUP_THRESHOLD:
+        if best_sim > self.dedup_threshold:
             return self._entry_ids[best_idx]
         return None
 
@@ -303,7 +337,7 @@ class SharedMemoryStore:
         # 实际上 put 流程是先写 SQLite 再加索引，所以新 entry 已经在 _embeddings 末尾
         # 我们只检查前面的条目
         for idx, sim in enumerate(sims[:-1]):
-            if _CONFLICT_LOW < float(sim) < _CONFLICT_HIGH:
+            if self.conflict_low < float(sim) < self.conflict_high:
                 existing_id = self._entry_ids[idx]
                 existing = self._entries_cache.get(existing_id)
                 if existing is None:
@@ -549,7 +583,17 @@ class SharedMemoryStore:
         """
         import time
 
-        entries_with_sim = self.query_by_similarity(query, top_k=10, min_sim=0.55)
+        # Denser stores can afford a stricter gate; short/underspecified queries
+        # receive a few extra candidates for recall.
+        density = len(self._entry_ids)
+        adaptive_top_k = self.retrieval_top_k + (3 if len(query.split()) <= 4 else 0)
+        adaptive_min_sim = min(
+            0.8,
+            self.retrieval_min_sim + (0.05 if density > 1000 else 0.0),
+        )
+        entries_with_sim = self.query_by_similarity(
+            query, top_k=adaptive_top_k * 2, min_sim=adaptive_min_sim
+        )
         if not entries_with_sim:
             return ""
 
@@ -558,7 +602,7 @@ class SharedMemoryStore:
         def _score(entry: MemoryEntry, sim: float) -> float:
             """综合得分 = 相似度 × confidence × 时间衰减。"""
             days_old = max((now - entry.timestamp) / 86400.0, 0.0)
-            recency = np.exp(-days_old / 30.0)  # 30 天半衰期
+            recency = np.exp(-days_old / self.recency_half_life_days)
             return sim * entry.confidence * recency
 
         # 按综合得分降序排序
@@ -572,7 +616,14 @@ class SharedMemoryStore:
         current_chars += len(header)
         parts.append(header)
 
+        selected_domains: set[str] = set()
         for entry, sim in entries_with_sim:
+            domain = str(entry.metadata.get("domain") or entry.source).split("/")[2:3]
+            domain_key = domain[0] if domain else str(entry.source)
+            # Lightweight MMR-style diversity: duplicate domains need stronger
+            # relevance than the configured minimum.
+            if domain_key in selected_domains and sim < adaptive_min_sim + 0.08:
+                continue
             block = (
                 f"- [{entry.topic}] {entry.claim}\n"
                 f"  来源: {entry.source} | 置信度: {entry.confidence:.2f} | "
@@ -582,11 +633,14 @@ class SharedMemoryStore:
                 break
             parts.append(block)
             current_chars += len(block)
+            selected_domains.add(domain_key)
+            if len(selected_domains) >= adaptive_top_k:
+                break
 
         return "".join(parts)
 
     def __len__(self) -> int:
-        return self.lt.count_entries(session_id=self.session_id or None)
+        return self.lt.count_entries(session_id=self.session_id)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """列出数据库中所有 session 及其统计信息。"""

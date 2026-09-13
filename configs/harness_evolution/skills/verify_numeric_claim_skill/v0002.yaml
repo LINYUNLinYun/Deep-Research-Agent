@@ -1,0 +1,39 @@
+artifact_id: verify_numeric_claim_skill
+version: v0002
+parent: v0001
+description: Conservative deterministic verification of numeric, monetary, percentage
+  and date claims.
+claim_types:
+- number
+- percentage
+- currency
+- date
+- fiscal_year
+primitives:
+- detect_numeric_claim
+- normalize_number
+- normalize_percentage
+- normalize_currency_unit
+- normalize_date_or_fiscal_year
+- rank_primary_sources
+- locate_source_span
+- compare_value_unit_date
+- resolve_source_conflict
+- classify_supported_contradicted_unknown
+parameters:
+  absolute_tolerance: 0.0
+  relative_tolerance: 0.0
+  date_tolerance_days: 0
+source_priority:
+- primary
+- official
+- academic
+- secondary
+- other
+conflict_policy: mark_unknown
+fallback:
+  no_source: mark_unknown
+  execution_error: mark_unknown
+limits:
+  max_sources: 5
+  max_source_spans: 10

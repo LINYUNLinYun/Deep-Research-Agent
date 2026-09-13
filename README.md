@@ -60,13 +60,15 @@
     ↓
 🤖 Worker Agents 调用 🔍 搜索 / 📄 论文 / 🌐 网页 工具
     ↓
-🧠 Memory Store 写入中间结果（去重 + 矛盾检测）
+🧠 每个 DAG 层完成后写入 Memory，供下游依赖消费
     ↓
-🗜️ Compressor 压缩长上下文（L1→L2→L3）
+🗜️ Compressor 按预算压缩 Worker / Replan / Summarizer 上下文
     ↓
-⚔️ Red Agent 攻击 → Blue Agent 修复 → 评分引擎评估
+📝 Summarizer 合成 Markdown 报告
     ↓
-📝 Summarizer 合成最终 Markdown 报告
+🔎 Claim–Evidence 验证；证据缺口可触发局部 replan
+    ↓
+⚔️ Red Agent 攻击 → Blue Agent 修复 → 修复后重新评分
     ↓
 📤 输出带元信息的结构化研究报告
 ```
@@ -81,7 +83,7 @@
 
 - 基于 `asyncio` + `Semaphore` 实现 **DAG 拓扑并发执行**
 - **9 状态状态机**：IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → ADVERSARIAL → DONE
-- **三级降级策略**：单任务超时标记继续 → >50% 失败触发 replan → 全局超时强制合成
+- **状态驱动降级**：综合失败比例、依赖影响、证据新颖度与预算决定 replan；全局超时用已有证据强制合成
 
 ### ⚔️ 2. Red-Blue 对抗降噪 —— 主动抑制幻觉
 
@@ -183,11 +185,46 @@ python scripts/run_all_experiments.py \
     --report_query "你的研究问题"
 ```
 
-> 批量实验默认配置：模块消融 5×12 题 + 轮数消融 4×12 题 + 标准评测 35 题 + 领域对比 3×5 题 + Agent vs LLM 3 题 + Judge 1 次 = **165 次独立研究运行**
+> 批量实验默认配置：模块消融 4×12 题 + 轮数消融 4×12 题 + 标准评测 35 题 + 领域对比 3×5 题 + Agent vs LLM 3 题 + Judge 1 次 = **153 次独立研究运行**
 
 ---
 
 ## 📁 仓库结构
+
+## 🧬 冻结模型的 Harness 自进化 V1
+
+项目提供与旧 GRPO 占位模块隔离的两条离线进化轨道：
+
+- `search_control_policy`：版本化搜索决策、阈值和动作；
+- `verify_numeric_claim_skill`：数字、百分比、金额、单位和日期事实验证。
+
+Policy/Skill YAML 不可覆盖，`production`、`candidate`、`canary` Registry 分离并校验 SHA-256。候选必须先完成严格 replay 与 held-out paired evaluation；即使门控通过也不会自动发布，只有显式 `promote` 才能改变 production 指针。
+
+```bash
+# 从 development/miner 评测产物提取失败经验
+python3 scripts/run_harness_evolution.py mine --input outputs/evaluation.json
+
+# LLM 提出假设，程序枚举并创建一个受约束候选
+python3 scripts/run_harness_evolution.py propose --track policy --use-llm
+
+# Numeric Skill 的无网络 held-out 评测
+python3 scripts/run_harness_evolution.py evaluate --track skill
+
+# 生成可审阅报告；无显著提升会明确 reject
+python3 scripts/run_harness_evolution.py report \
+  --experiment outputs/harness_evolution/<experiment_id>
+
+# 评审后手动晋升；不会自动执行
+python3 scripts/run_harness_evolution.py promote --decision <promotion_decision.json>
+
+# 历史版本仍保留，可显式回滚指针
+python3 scripts/run_harness_evolution.py rollback \
+  --artifact verify_numeric_claim_skill --version v0001
+```
+
+搜索 Policy 的正式评测需要为每道题准备严格工具 fixture，并传入 `--fixture-dir`。未命中的工具请求会 fail-fast，不会回退到真实网络。
+
+仓库附带一次离线 Skill 候选实验：production=`v0001`、candidate=`v0002`，24 个 held-out pair 全部持平，因此 Promotion Gate 返回 reject。该结果用于证明隔离、追溯和“无提升不晋升”，不代表真实端到端质量已经提点；Search Policy 的付费模型 replay 质量仍需实验验证。
 
 ```raw
 deep_research_agent/
@@ -209,6 +246,7 @@ deep_research_agent/
 │   ├── 📁 memory/                 # 🧠 M4: 共享记忆存储
 │   ├── 📁 adversarial/            # ⚔️ M5: 对抗降噪循环
 │   ├── 📁 evolution/              # 🧬 M6: 自进化引擎
+│   ├── 📁 harness_evolution/      # 🧬 Policy/Skill 版本、Replay 与晋升门控
 │   ├── 📁 agents/                 # 🤖 Agent 实现
 │   ├── 📁 models/                 # 🔌 模型路由层
 │   ├── 📁 tools/                  # 🛠️ 工具层

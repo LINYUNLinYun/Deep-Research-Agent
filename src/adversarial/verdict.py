@@ -127,6 +127,8 @@ class RedVerdict:
     raw_feedback: str = ""
     status: str = "success"
     error: str = ""
+    issue_stats: dict[str, int] = field(default_factory=dict)
+    retry_stats: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +138,8 @@ class RedVerdict:
             "raw_feedback": self.raw_feedback,
             "status": self.status,
             "error": self.error,
+            "issue_stats": dict(self.issue_stats),
+            "retry_stats": dict(self.retry_stats),
         }
 
     @classmethod
@@ -150,6 +154,8 @@ class RedVerdict:
             raw_feedback=data.get("raw_feedback", ""),
             status=data.get("status", "success"),
             error=data.get("error", ""),
+            issue_stats=data.get("issue_stats", {}),
+            retry_stats=data.get("retry_stats", {}),
         )
 
 

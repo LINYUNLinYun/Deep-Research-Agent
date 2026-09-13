@@ -20,9 +20,9 @@ import logging
 import os
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
-from .runner import initialize_modules, run_research
+from .runner import collect_harness_telemetry, initialize_modules, run_research
 
 logger = logging.getLogger("ablation")
 
@@ -34,9 +34,35 @@ class AblationStudy:
     DEFAULT_MODULE_ABLATIONS: dict[str, tuple[str, dict]] = {
         "full": ("完整系统", {}),
         "no_adversarial": ("关闭对抗降噪", {"adversarial": {"enabled": False}}),
-        "no_compressor": ("关闭上下文压缩", {"compressor": {"enable_multilevel": False}}),
+        # Disable both the high-level switch and legacy multilevel flag.  The
+        # runner now honours ``compressor.enabled`` while older configs only
+        # inspected ``enable_multilevel``; setting both makes the ablation
+        # semantically unambiguous across versions.
+        "no_compressor": (
+            "关闭上下文压缩",
+            {"compressor": {"enabled": False, "enable_multilevel": False}},
+        ),
         "no_memory": ("关闭记忆存储", {"memory": {"enabled": False}}),
-        "no_evolution": ("关闭进化学习", {"evolution": {"enabled": False}}),
+    }
+
+    HARNESS_ABLATIONS: dict[str, tuple[str, dict]] = {
+        "harness_full": ("完整 Harness", {}),
+        "no_search_control": (
+            "关闭 query rewrite 和跨 Agent 搜索去重",
+            {"tools": {"search_control": {"enabled": False}}},
+        ),
+        "no_evidence_verifier": (
+            "关闭 claim-level evidence verification",
+            {"adversarial": {"evidence_verification_enabled": False}},
+        ),
+        "static_replan": (
+            "关闭状态驱动 replan",
+            {"planner": {"enable_replan": False}},
+        ),
+        "no_harness_evolution": (
+            "关闭版本化 Search Policy 与 Numeric Skill",
+            {"harness_evolution": {"enabled": False}},
+        ),
     }
 
     @staticmethod
@@ -54,6 +80,49 @@ class AblationStudy:
 
         return _deep_merge(cfg, overrides)
 
+    @staticmethod
+    def _score_report(
+        report: str,
+        question: dict[str, Any],
+        evaluator: Callable[[str, dict[str, Any]], float | dict[str, Any]] | None = None,
+    ) -> tuple[float, dict[str, Any]]:
+        """Score a report without fabricating a ``1.0`` success score.
+
+        Callers can inject a project-specific evaluator.  For ResearchBench
+        shaped questions we provide a lightweight built-in evaluator so the
+        generic ablation API remains useful, while preserving a deterministic
+        success fallback for arbitrary question dictionaries that contain no
+        expected facts/topics.
+        """
+        if evaluator is not None:
+            value = evaluator(report, question)
+            if isinstance(value, dict):
+                score = float(value.get("composite_score", value.get("score", 0.0)))
+                return score, value
+            return float(value), {"composite_score": float(value)}
+
+        if question.get("ground_truth") or question.get("expected_topics"):
+            # Import lazily to keep core usable without the optional evaluation
+            # package at module import time.
+            from evaluation.metrics.rule_based import RuleBasedMetrics
+
+            ground_truth = question.get("ground_truth", {})
+            expected_topics = question.get("expected_topics", [])
+            factual = RuleBasedMetrics.fact_accuracy(report, ground_truth)
+            metrics = {
+                "factual_accuracy": factual,
+                "logical_consistency": RuleBasedMetrics.logical_consistency(report),
+                "citation_coverage": RuleBasedMetrics.citation_coverage(report),
+                "bias": max(0.0, 1.0 - RuleBasedMetrics.hallucination_rate(report)),
+                "comprehensiveness": RuleBasedMetrics.comprehensiveness(report, expected_topics),
+            }
+            composite = RuleBasedMetrics.composite_score(metrics)
+            return composite, {"composite_score": composite, "metrics": metrics}
+
+        # No oracle was supplied; report success is a status signal, not a
+        # quality score.  Keep the old shape but label it explicitly.
+        return (1.0 if report else 0.0), {"status_score": 1.0 if report else 0.0}
+
     # -----------------------------------------------------------------------
     # 模块消融：full / no_XXX
     # -----------------------------------------------------------------------
@@ -63,6 +132,7 @@ class AblationStudy:
         config: dict,
         questions: list[dict[str, Any]],
         systems: dict[str, tuple[str, dict]] | None = None,
+        evaluator: Callable[[str, dict[str, Any]], float | dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         运行模块消融实验。
@@ -88,6 +158,7 @@ class AblationStudy:
 
             cfg = cls.override_config(config, overrides)
             modules = initialize_modules(cfg)
+            base_session = getattr(modules.get("memory_store"), "session_id", "")
 
             scores: list[float] = []
             details: list[dict[str, Any]] = []
@@ -99,20 +170,24 @@ class AblationStudy:
 
                 start = time.time()
                 try:
+                    if modules.get("memory_store") is not None:
+                        modules["memory_store"].set_session(f"{base_session}:{name}:{qid}")
                     report = asyncio.run(run_research(query, cfg, modules))
                     elapsed = time.time() - start
 
-                    # 评分由外部调用方注入（避免 evaluation/ 反向依赖）
-                    # 这里只记录原始报告和元信息
+                    score, score_detail = cls._score_report(report, q, evaluator)
                     details.append({
                         "question_id": qid,
                         "query": query,
                         "elapsed_seconds": elapsed,
                         "report_length": len(report),
                         "system": name,
+                        "composite_score": score,
+                        "score_detail": score_detail,
+                        "harness": collect_harness_telemetry(modules),
                     })
-                    scores.append(1.0)  # 占位，实际分数由外部 evaluator 填充
-                    logger.info(f"    → 成功, time={elapsed:.1f}s, len={len(report)}")
+                    scores.append(score)
+                    logger.info(f"    → score={score:.3f}, time={elapsed:.1f}s, len={len(report)}")
 
                 except Exception as e:
                     logger.warning(f"    → 失败: {e}")
@@ -149,6 +224,7 @@ class AblationStudy:
         config: dict,
         questions: list[dict[str, Any]],
         max_rounds: int = 3,
+        evaluator: Callable[[str, dict[str, Any]], float | dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         在不同对抗轮数下运行评测。
@@ -177,6 +253,7 @@ class AblationStudy:
             }
             cfg = cls.override_config(config, overrides)
             modules = initialize_modules(cfg)
+            base_session = getattr(modules.get("memory_store"), "session_id", "")
 
             scores: list[float] = []
             details: list[dict[str, Any]] = []
@@ -187,13 +264,19 @@ class AblationStudy:
                 logger.info(f"  [{idx}/{len(questions)}] {qid}")
 
                 try:
+                    if modules.get("memory_store") is not None:
+                        modules["memory_store"].set_session(f"{base_session}:adv_{rounds}:{qid}")
                     report = asyncio.run(run_research(query, cfg, modules))
-                    scores.append(1.0)  # 占位
+                    score, score_detail = cls._score_report(report, q, evaluator)
+                    scores.append(score)
                     details.append({
                         "question_id": qid,
                         "query": query,
                         "rounds": rounds,
                         "report_length": len(report),
+                        "composite_score": score,
+                        "score_detail": score_detail,
+                        "harness": collect_harness_telemetry(modules),
                     })
                 except Exception as e:
                     logger.warning(f"    → 失败: {e}")

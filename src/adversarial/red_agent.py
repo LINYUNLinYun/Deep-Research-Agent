@@ -11,6 +11,8 @@ Red Agent 的职责是对研究报告进行多维度"攻击"，找出事实错�
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import re
 from typing import Any
@@ -257,15 +259,32 @@ class RedAgent:
         max_tokens: 单维度评估的最大输出 token 数。
     """
 
-    def __init__(self, policy, max_tokens: int = 2048):
+    def __init__(
+        self,
+        policy,
+        max_tokens: int = 4096,
+        max_issues: int = 5,
+        max_issues_per_dimension: int = 2,
+        max_sources: int = 20,
+        context_chars: int = 8000,
+        dimension_parse_retries: int = 1,
+    ):
         """初始化 Red Agent。
 
         Args:
             policy: 任意实现了 __call__(messages:list) -> OpenAICompatibleDict 的对象。
             max_tokens: 每个维度评估的最大输出长度。
+            max_issues: 单轮最多交给 Blue Agent 的问题数。
         """
         self.policy = policy
         self.max_tokens = max_tokens
+        self.max_issues = max(1, int(max_issues))
+        self.max_issues_per_dimension = max(1, int(max_issues_per_dimension))
+        self.max_sources = max(1, int(max_sources))
+        self.context_chars = max(1000, min(int(context_chars), 32000))
+        self.dimension_parse_retries = max(0, min(int(dimension_parse_retries), 3))
+        self.last_issue_stats = {"raw": 0, "deduplicated": 0, "selected": 0}
+        self.last_retry_stats = {"attempted": 0, "recovered": 0, "exhausted": 0}
 
     @trace_agent(name="red_agent.attack", tags=["m5", "red", "adversarial"])
     async def attack(self, report: ResearchReport) -> RedVerdict:
@@ -287,13 +306,16 @@ class RedAgent:
         raw_feedbacks: list[str] = []
         errors: list[str] = []
         backend_unavailable = False
+        retry_attempted = 0
+        retry_recovered = 0
+        retry_exhausted = 0
 
-        # 截断报告内容，避免单条 prompt 超过上下文限制
-        content_truncated = report.content[:4000] if len(report.content) > 4000 else report.content
-        if len(report.content) > 4000:
-            content_truncated += "\n\n[报告已截断，仅显示前 4000 字符]"
+        # Bound every dimension prompt, but retain the report tail as well.  A
+        # head-only excerpt systematically hid conclusions and references,
+        # making Red's score an unreliable gate for long reports.
+        content_truncated = self._excerpt(report.content, max_len=self.context_chars)
         
-        sources_text = self._format_sources(report.sources, max_items=15)
+        sources_text = self._format_sources(report.sources, max_items=self.max_sources)
 
         for dim, prompt_template in DIMENSION_PROMPTS.items():
             # 使用安全替换，避免 report.content/sources_text 中的 { 被 format 误解析
@@ -301,38 +323,89 @@ class RedAgent:
             prompt = prompt.replace("{query}", report.query)
             prompt = prompt.replace("{content}", content_truncated)
             prompt = prompt.replace("{sources}", sources_text)
+            prompt += (
+                "\n\n输出预算约束：issues 只保留本维度最高优先级的最多 "
+                f"{self.max_issues_per_dimension} 个；不要枚举次要或重复问题。"
+            )
             messages = [
                 {"role": "system", "content": SYSTEM_RED_AGENT},
                 {"role": "user", "content": prompt},
             ]
 
-            try:
-                # 临时调大 max_tokens 以容纳长输出
-                old_max = getattr(self.policy, "max_tokens", None)
-                if old_max is not None:
-                    self.policy.max_tokens = self.max_tokens
+            dimension_ok = False
+            last_error: Exception | None = None
+            for attempt in range(self.dimension_parse_retries + 1):
                 try:
-                    resp = self.policy(messages)
+                    # 临时调大 max_tokens 以容纳长输出
+                    old_max = getattr(self.policy, "max_tokens", None)
+                    if old_max is not None:
+                        self.policy.max_tokens = self.max_tokens
+                    resp = await self._call_policy(messages)
                     if getattr(resp, "get", None) and resp.get("status") == "failed":
                         backend_unavailable = True
                         raise RuntimeError(resp.get("error", "Red Agent backend unavailable"))
 
                     raw = (resp.get("content", "") if isinstance(resp, dict) else getattr(resp, "content", "")) or ""
-                    raw_feedbacks.append(f"[{dim.value}]\n{raw}\n")
-                    score, issues = self._parse_json_output(raw, dim)
+                    raw_feedbacks.append(
+                        f"[{dim.value} attempt={attempt + 1}]\n{raw}\n"
+                    )
+                    try:
+                        score, issues = self._parse_json_output(raw, dim)
+                    except ValueError as exc:
+                        last_error = exc
+                        if attempt >= self.dimension_parse_retries:
+                            retry_exhausted += 1
+                            break
+                        retry_attempted += 1
+                        messages = [
+                            {"role": "system", "content": SYSTEM_RED_AGENT},
+                            {"role": "user", "content": prompt + (
+                                "\n\n上一次输出无法解析。请只返回一个合法 JSON 对象，"
+                                "不要使用 Markdown 代码块或附加解释。"
+                            )},
+                        ]
+                        continue
                     dimension_scores[dim] = score
                     all_issues.extend(issues)
+                    dimension_ok = True
+                    if attempt:
+                        retry_recovered += 1
+                    break
+                except Exception as exc:
+                    # Backend/transport failures are not parse failures. Do
+                    # not multiply requests against an unhealthy dependency.
+                    last_error = exc
+                    break
                 finally:
                     if old_max is not None:
                         self.policy.max_tokens = old_max
-            except Exception as e:
+            if not dimension_ok:
                 # A failed dimension is a failed adversarial evaluation, not a
                 # neutral/high score.  The loop will skip optimization.
-                errors.append(f"{dim.value}: {e}")
+                error = last_error or RuntimeError("unknown Red dimension error")
+                errors.append(f"{dim.value}: {error}")
                 dimension_scores[dim] = 0.0
-                raw_feedbacks.append(f"[{dim.value}]\nERROR: {e}\n")
+                raw_feedbacks.append(f"[{dim.value}]\nERROR: {error}\n")
                 if backend_unavailable:
                     break
+
+        raw_issue_count = len(all_issues)
+        deduplicated_issues = self._deduplicate_issues(all_issues)
+        all_issues = sorted(
+            deduplicated_issues,
+            key=VerdictEngine.compute_priority,
+            reverse=True,
+        )[: self.max_issues]
+        self.last_issue_stats = {
+            "raw": raw_issue_count,
+            "deduplicated": len(deduplicated_issues),
+            "selected": len(all_issues),
+        }
+        self.last_retry_stats = {
+            "attempted": retry_attempted,
+            "recovered": retry_recovered,
+            "exhausted": retry_exhausted,
+        }
 
         status = "failed" if errors else "success"
         overall = VerdictEngine.compute_overall(dimension_scores) if not errors else 0.0
@@ -343,7 +416,43 @@ class RedAgent:
             raw_feedback="\n".join(raw_feedbacks),
             status=status,
             error="; ".join(errors),
+            issue_stats=dict(self.last_issue_stats),
+            retry_stats=dict(self.last_retry_stats),
         )
+
+    async def _call_policy(self, messages: list[dict[str, str]]) -> Any:
+        """Call sync policies off-loop so the enclosing hard timeout can fire."""
+        call = self.policy
+        call_method = getattr(call, "__call__", None)
+        if inspect.iscoroutinefunction(call) or inspect.iscoroutinefunction(call_method):
+            result = call(messages)
+        else:
+            result = await asyncio.to_thread(call, messages)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    def _select_issues(self, issues: list[Issue]) -> list[Issue]:
+        """去重并只保留最高优先级问题，给 Blue 的调用量设置硬边界。"""
+        unique = self._deduplicate_issues(issues)
+        unique.sort(key=VerdictEngine.compute_priority, reverse=True)
+        return unique[: self.max_issues]
+
+    @staticmethod
+    def _deduplicate_issues(issues: list[Issue]) -> list[Issue]:
+        unique: list[Issue] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for issue in issues:
+            dimension = getattr(issue.dimension, "value", str(issue.dimension))
+            fix_type = getattr(issue.fix_type, "value", str(issue.fix_type))
+            location = " ".join((issue.location or "").lower().split())
+            description = " ".join((issue.description or "").lower().split())
+            key = (dimension, location, fix_type, description if not location else "")
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(issue)
+        return unique
 
     def _format_sources(self, sources: list[dict], max_items: int = 15) -> str:
         """将来源列表格式化为文本，供 Prompt 使用。截断以避免上下文膨胀。"""
@@ -358,6 +467,17 @@ class RedAgent:
         if len(sources) > max_items:
             lines.append(f"... 还有 {len(sources) - max_items} 个来源未显示")
         return "\n".join(lines)
+
+    @staticmethod
+    def _excerpt(content: str, max_len: int = 4000) -> str:
+        """Return a head/tail excerpt for bounded adversarial prompts."""
+        if len(content) <= max_len:
+            return content
+        marker = "\n\n[报告中间内容省略；请同时检查显示的开头和结尾]\n\n"
+        available = max(0, max_len - len(marker))
+        head_len = available // 2
+        tail_len = available - head_len
+        return content[:head_len] + marker + content[-tail_len:]
 
     def _parse_json_output(self, raw: str, dimension: Dimension) -> tuple[float, list[Issue]]:
         """解析模型 JSON 输出，提取分数和 issues。

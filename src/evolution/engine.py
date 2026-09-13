@@ -1,17 +1,17 @@
 """
-M6 自进化引擎 — 训练循环编排 (Self-Evolution Engine)
+M6 自进化引擎 — 轨迹与训练数据准备骨架
 
 SelfEvolutionEngine 实现完整的 MAE（Maker-Advisor-Evaluator）三角架构：
 - Proposer: 生成研究问题（L1/L2/L3）
 - Solver: DeepResearch Agent 本身
 - Judge: 五维连续 reward 评分
-- GRPO Trainer: 复用项目一 veRL 框架
+- GRPO Trainer: 尚未接入；当前只生成训练数据
 
 设计决策：
 1. 每轮生成 32 个问题，展开为 32 × 8 group = 256 trajectories，保证梯度方差可控。
-2. Judge 评分后通过 shape_reward 映射到 [-1, 1]，直接喂给 veRL GRPO trainer。
+2. Judge 评分后通过 shape_reward 映射到 [-1, 1]，写入待训练 parquet。
 3. 每 3 轮触发 Symbolic Learning，每 5 轮触发 Judge 校准。
-4. 所有中间数据（parquet、checkpoint、log）按轮次目录隔离，便于追溯。
+4. 所有中间数据（parquet、log）按轮次目录隔离，便于追溯。
 """
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ class SelfEvolutionEngine:
             汇总统计字典。
         """
         logger.info(f"[SelfEvolutionEngine] Starting {num_rounds} rounds of self-evolution")
-        summary = {"rounds": [], "final_avg_score": 0.0}
+        summary = {"rounds": [], "final_avg_score": 0.0, "training_performed": False}
 
         for r in range(1, num_rounds + 1):
             self.current_round = r
@@ -105,7 +105,7 @@ class SelfEvolutionEngine:
         4. Judge.evaluate() → 5维连续 reward
         5. shape_reward_for_grpo() → 单值 reward [-1, 1]
         6. build_evolution_parquet() → veRL 标准 parquet
-        7. veRL GRPO trainer: 50 steps（复用项目一 veRL）
+        7. 明确记录 GRPO trainer 尚未执行
         8. Experience Memory 更新
         9. (每 3 轮) Symbolic Learning → 优化 prompts
         10. (每 5 轮) Judge 校准
@@ -251,12 +251,15 @@ class SelfEvolutionEngine:
         #
         # 训练完成后，更新的模型权重会自动保存到 checkpoint_dir。
         # =====================================================================
-        checkpoint_dir = os.path.join(round_dir, "checkpoint")
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        round_stats["checkpoint_dir"] = checkpoint_dir
-        logger.info(
-            f"[Round {self.current_round}] GRPO training placeholder: "
-            f"load {parquet_path} -> veRL trainer -> save to {checkpoint_dir}"
+        # Do not create a checkpoint-looking directory: no trainer is wired in
+        # this legacy pipeline yet.  Callers can use the command explicitly as a
+        # data-preparation run, but its output must not look like trained state.
+        round_stats["checkpoint_dir"] = ""
+        round_stats["training_performed"] = False
+        round_stats["training_status"] = "not_implemented"
+        logger.warning(
+            f"[Round {self.current_round}] GRPO training was not performed; "
+            f"prepared data only at {parquet_path}"
         )
 
         # =====================================================================

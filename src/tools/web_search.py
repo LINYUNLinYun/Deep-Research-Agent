@@ -70,6 +70,9 @@ class MockWebSearchTool(BaseWebSearchTool):
 
     def __init__(self, delay_ms: tuple[int, int] = (50, 200)) -> None:
         self.delay_ms = delay_ms
+        # Shared by ResearcherAgent instances that receive this tool object.
+        from .search_controller import SearchController
+        self.search_controller = SearchController()
 
     async def execute(self, query: str, top_n: int = 5) -> dict[str, Any]:
         await asyncio.sleep(random.randint(*self.delay_ms) / 1000.0)
@@ -147,6 +150,11 @@ class WebSearchTool(BaseWebSearchTool):
 
     def __init__(self, backend: str | None = None, api_key: str | None = None, api_endpoint: str | None = None) -> None:
         self.backend = (backend or get_env("SEARCH_BACKEND", "serpapi")).lower().strip()
+        # ResearcherAgent uses this session-level controller for query/result
+        # deduplication. Keeping it on the shared tool instance means parallel
+        # workers see the same evidence cache without changing the tool API.
+        from .search_controller import SearchController
+        self.search_controller = SearchController()
 
         # SerpAPI 配置
         self.serpapi_key = api_key or get_env("SERPAPI_KEY")

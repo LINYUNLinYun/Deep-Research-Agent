@@ -25,12 +25,14 @@
 from __future__ import annotations
 
 import os
+import time
+from typing import Any, Callable
 
 from ..utils.env_config import ensure_env_loaded, get_env
 from .vllm_policy import VLLMPolicy
 
 
-__all__ = ["ModelRouter"]
+__all__ = ["ModelRouter", "AdaptiveModelPolicy"]
 
 # 全局缓存，避免重复读取 .env 和创建 client
 _BACKEND_CACHE: dict[str, VLLMPolicy] = {}
@@ -41,6 +43,11 @@ class ModelRouter:
 
     所有方法都是类方法 / 静态方法，无需实例化。
     """
+
+    @staticmethod
+    def clear_cache() -> None:
+        """Drop process-local backend instances between isolated evaluations."""
+        _BACKEND_CACHE.clear()
 
     @staticmethod
     def create_backend(
@@ -62,11 +69,19 @@ class ModelRouter:
         """
         ensure_env_loaded()
 
+        use_cache = bool(override_kwargs.pop("use_cache", True))
+
         name = (backend_name or get_env("DEFAULT_LLM_BACKEND", "vllm")).lower().strip()
+        if name == "auto":
+            configured = [
+                candidate for candidate in ("deepseek", "openai", "mimo")
+                if ModelRouter._is_backend_configured(candidate)
+            ]
+            name = configured[0] if configured else "vllm"
 
         # 检查缓存
         cache_key = f"{name}:{hash(tuple(sorted(override_kwargs.items())))}"
-        if cache_key in _BACKEND_CACHE:
+        if use_cache and cache_key in _BACKEND_CACHE:
             return _BACKEND_CACHE[cache_key]
 
         # 根据名称读取 .env 配置
@@ -75,7 +90,8 @@ class ModelRouter:
 
         # 创建 VLLMPolicy 实例
         policy = VLLMPolicy(**config)
-        _BACKEND_CACHE[cache_key] = policy
+        if use_cache:
+            _BACKEND_CACHE[cache_key] = policy
         return policy
 
     @staticmethod
@@ -133,7 +149,7 @@ class ModelRouter:
         base_url = get_env(f"{prefix}_BASE_URL")
         model = get_env(f"{prefix}_MODEL")
 
-        if api_key is None and base_url is None:
+        if api_key is None and base_url is None and name != "vllm":
             raise ValueError(
                 f"后端 '{name}' 未配置。请在 .env 或 .env.local 中设置 "
                 f"{prefix}_API_KEY 和/或 {prefix}_BASE_URL。"
@@ -193,3 +209,101 @@ class ModelRouter:
             config["base_url"] = "https://api.xiaomimimo.com/v1"
 
         return config
+
+
+class AdaptiveModelPolicy:
+    """Health-aware, budget-conscious policy wrapper with backend fallback.
+
+    Candidate factories are lazy so a missing optional provider never prevents
+    startup. Routing decisions are exposed through ``decision_trace``.
+    """
+
+    def __init__(
+        self,
+        candidates: list[tuple[str, Callable[[], Any]]],
+        max_retries: int = 1,
+        retry_delay: float = 0.0,
+        failure_cooldown: float = 60.0,
+    ) -> None:
+        if not candidates:
+            raise ValueError("AdaptiveModelPolicy requires at least one candidate")
+        self._candidate_factories = candidates
+        self._policies: dict[str, Any] = {}
+        self._health: dict[str, dict[str, float]] = {}
+        self.max_retries = max(0, int(max_retries))
+        self.retry_delay = max(0.0, float(retry_delay))
+        self.failure_cooldown = max(0.0, float(failure_cooldown))
+        self.tools = None
+        self.was_truncated = False
+        self.decision_trace: list[dict[str, Any]] = []
+
+    def set_tools(self, tools: list[dict]) -> None:
+        self.tools = tools
+
+    @property
+    def model_name(self) -> str:
+        return "adaptive(" + ",".join(name for name, _ in self._candidate_factories) + ")"
+
+    def _get(self, name: str, factory: Callable[[], Any]) -> Any:
+        if name not in self._policies:
+            self._policies[name] = factory()
+        return self._policies[name]
+
+    def _ordered_candidates(self, messages: list[dict]) -> list[tuple[str, Callable[[], Any]]]:
+        text = " ".join(str(message.get("content", "")) for message in messages if isinstance(message, dict))
+        complex_task = len(text) > 12000 or any(
+            marker in text.lower()
+            for marker in ("contradict", "verify", "causal", "json", "规划", "验证", "冲突")
+        )
+        available = []
+        now = time.monotonic()
+        for candidate in self._candidate_factories:
+            unhealthy_until = self._health.get(candidate[0], {}).get("unhealthy_until", 0.0)
+            if unhealthy_until <= now:
+                available.append(candidate)
+        available = available or list(self._candidate_factories)
+        return list(reversed(available)) if complex_task else available
+
+    def __call__(self, messages: list[dict]):
+        last_error: Exception | None = None
+        for name, factory in self._ordered_candidates(messages):
+            started = time.monotonic()
+            try:
+                policy = self._get(name, factory)
+            except Exception as exc:
+                last_error = exc
+                self._mark_failure(name)
+                continue
+            if hasattr(policy, "set_tools"):
+                policy.set_tools(self.tools)
+            for attempt in range(self.max_retries + 1):
+                try:
+                    response = policy(messages)
+                    if getattr(response, "get", None) and response.get("status") == "failed":
+                        raise RuntimeError(response.get("error", "backend returned failed status"))
+                    self.was_truncated = bool(getattr(policy, "was_truncated", False))
+                    self.decision_trace.append({
+                        "backend": name,
+                        "attempt": attempt + 1,
+                        "latency": time.monotonic() - started,
+                        "status": "success",
+                    })
+                    return response
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < self.max_retries and self.retry_delay:
+                        time.sleep(self.retry_delay * (2 ** attempt))
+            self._mark_failure(name)
+            self.decision_trace.append({
+                "backend": name,
+                "attempt": self.max_retries + 1,
+                "latency": time.monotonic() - started,
+                "status": "failed",
+                "error": str(last_error),
+            })
+        raise RuntimeError(f"All model backends failed: {last_error}")
+
+    def _mark_failure(self, name: str) -> None:
+        health = self._health.setdefault(name, {"failures": 0.0, "unhealthy_until": 0.0})
+        health["failures"] += 1
+        health["unhealthy_until"] = time.monotonic() + self.failure_cooldown

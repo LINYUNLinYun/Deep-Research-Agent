@@ -60,6 +60,7 @@ def override_config(config: dict, system_name: str) -> dict:
     elif system_name == "no_evolution":
         cfg.setdefault("evolution", {})["enabled"] = False
     elif system_name == "no_compressor":
+        cfg.setdefault("compressor", {})["enabled"] = False
         cfg.setdefault("compressor", {})["enable_multilevel"] = False
     elif system_name == "no_memory":
         cfg.setdefault("memory", {})["enabled"] = False
