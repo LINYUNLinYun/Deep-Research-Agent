@@ -1,9 +1,31 @@
-"""Planner 子包：M2 自适应规划层。"""
+"""Planner 子包：M2 自适应规划层与策略二研究状态图。"""
 from __future__ import annotations
 
-# 为避免循环导入，请直接从子模块导入：
-#   from planner.dag import DAG
-#   from planner.planner import Planner
-#   from planner.budget_tracker import BudgetTracker
+# The state graph has no dependency on Planner/Orchestrator, so exporting it
+# here is safe and keeps the integration point discoverable.  DAG/Planner
+# remain available from their original submodules to avoid import cycles.
+from .research_state import (
+    ActionScore,
+    Claim,
+    ClaimState,
+    DecisionRecord,
+    Facet,
+    FacetState,
+    FrontierAction,
+    OpenQuestion,
+    OpenQuestionState,
+    ResearchStateGraph,
+)
 
-__all__ = []
+__all__ = [
+    "ActionScore",
+    "Claim",
+    "ClaimState",
+    "DecisionRecord",
+    "Facet",
+    "FacetState",
+    "FrontierAction",
+    "OpenQuestion",
+    "OpenQuestionState",
+    "ResearchStateGraph",
+]

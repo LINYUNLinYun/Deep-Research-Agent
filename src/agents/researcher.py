@@ -106,6 +106,12 @@ class ResearcherAgent(BaseAgent):
             "query_type": task.expected_type,
             "unresolved_claims": context.get("unresolved_claims", []),
             "remaining_search_budget": self.max_tool_calls or self.max_turns,
+            "facet_id": task.facet_id,
+            "facet": context.get("facet", task.description),
+            "claim_ids": list(task.claim_ids or []),
+            "source_cluster_ids": context.get("source_cluster_ids", []),
+            "action": context.get("frontier_action", "search_new_facet"),
+            "estimated_value": context.get("frontier_estimated_value"),
         }
 
         # 构建任务描述

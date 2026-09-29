@@ -64,6 +64,8 @@ class Orchestrator:
         memory_store: Any | None = None,
         summarizer_policy: Any | None = None,
         evidence_verifier: Any | None = None,
+        max_catalog_sources: int = 24,
+        max_catalog_chars: int = 12_000,
     ) -> None:
         self.planner = planner
         self.agent_pool = agent_pool
@@ -73,6 +75,8 @@ class Orchestrator:
         self.memory_store = memory_store
         self.summarizer_policy = summarizer_policy
         self.evidence_verifier = evidence_verifier
+        self.max_catalog_sources = max_catalog_sources
+        self.max_catalog_chars = max_catalog_chars
 
         # 运行时状态（保留 dict 作为快速缓存，M4 提供持久化 + 语义检索）
         self._memory_store: dict[str, Any] = {}
@@ -91,6 +95,8 @@ class Orchestrator:
         self._low_novelty_rounds: int = 0
         self._pending_replan_reason: str = ""
         self._reusable_results: dict[str, AgentResult] = {}
+        self._research_graph: Any | None = None
+        self._facet_task_outcomes: dict[str, dict[str, AgentResult]] = {}
 
         # 状态机处理器映射
         self._state_handlers: dict[OrchestratorState, Callable[[], asyncio.Future[OrchestratorState]]] = {
@@ -130,6 +136,8 @@ class Orchestrator:
         self._low_novelty_rounds = 0
         self._pending_replan_reason = ""
         self._reusable_results.clear()
+        self._research_graph = None
+        self._facet_task_outcomes.clear()
         self._memory_store.clear()
         self._results.clear()
         self._historical_results.clear()
@@ -166,6 +174,8 @@ class Orchestrator:
             report.num_replan = self._replan_count
             report.adversarial_rounds = self._adversarial_count
             report.decision_trace = [record.to_dict() for record in self._decision_trace]
+            if self._research_graph is not None:
+                report.research_state = self._research_graph.to_dict()
 
             # M4: 将最终报告存入 SharedMemoryStore
             if self.memory_store is not None:
@@ -223,6 +233,7 @@ class Orchestrator:
             if not self._task_map:
                 # 降级：如果解析失败，使用占位符
                 self._task_map = self._rebuild_task_map_from_dag()
+            self._initialize_research_state()
         except PlanParseError as e:
             print(f"[Planning] Failed: {e}")
             return OrchestratorState.FAILED
@@ -386,6 +397,7 @@ class Orchestrator:
                 subtask = self._task_map.get(result.task_id)
                 if subtask is not None and result.status == AgentStatus.SUCCESS:
                     self._reusable_results[self._task_signature(subtask)] = result
+            self._update_research_state_layer(all_results[-len(layer_results):], layer_idx)
 
         self._results = all_results
         return OrchestratorState.COLLECTING
@@ -486,12 +498,6 @@ class Orchestrator:
             "results": self._historical_results + self._results,
             "prior_report": self._memory_store.get("prior_report"),
         }
-        # Source provenance is collected from canonical trajectories before
-        # any L3 aggregation. Compression may change the model-facing text but
-        # must never change the citation/evidence catalog.
-        from ..evidence import EvidenceLedger
-        context["source_catalog"] = EvidenceLedger().catalog(context["results"])
-
         # Synthesis has a dedicated policy and should not borrow/leak a worker
         # from the analyze pool.
         from ..agents.summarizer import SummarizerAgent
@@ -503,7 +509,18 @@ class Orchestrator:
             await self.agent_pool.release_agent(borrowed)
         else:
             tools = []
-        agent = SummarizerAgent(name="summarizer", policy=policy, tools=tools)
+        agent = SummarizerAgent(
+            name="summarizer",
+            policy=policy,
+            tools=tools,
+            max_catalog_sources=self.max_catalog_sources,
+            max_catalog_chars=self.max_catalog_chars,
+        )
+
+        # Freeze provenance before any L3 aggregation, but pass only a ranked,
+        # token-bounded projection to the synthesizer. The lossless bundles on
+        # AgentResult remain available for later verification.
+        context["source_catalog"] = agent.collect_sources(self._query, context["results"])
 
         if self.compressor is not None:
             context["results"] = self._compress_results_for_context(context["results"])
@@ -663,6 +680,7 @@ class Orchestrator:
             self._task_map = self.planner.get_task_map_from_dag(self._dag, self.planner._last_raw_json)
             if not self._task_map:
                 self._task_map = self._rebuild_task_map_from_dag()
+            self._extend_research_state()
             # Preserve successful evidence for final synthesis while the next
             # dispatch round gets a clean result set for failure accounting.
             self._historical_results.extend(
@@ -825,6 +843,19 @@ class Orchestrator:
         """为单个 SubTask 构建执行上下文。"""
         ctx = dict(self._memory_store)
         ctx["query"] = self._query
+        facet_id = subtask.facet_id or subtask.task_id
+        if self._research_graph is not None:
+            facet = self._research_graph.facets.get(facet_id)
+            if facet is not None:
+                ctx["facet"] = facet.description
+                ctx["source_cluster_ids"] = sorted({
+                    cluster
+                    for result in self._facet_task_outcomes.get(facet_id, {}).values()
+                    for cluster in self._result_source_clusters(result)
+                })
+                score = self._research_graph.score_details("search_new_facet", facet_id)
+                ctx["frontier_action"] = "search_new_facet"
+                ctx["frontier_estimated_value"] = score.value if score is not None else 0.0
         # 注入依赖任务的结果
         for dep_id in subtask.dependencies:
             dep_key = f"result:{dep_id}"
@@ -844,6 +875,142 @@ class Orchestrator:
                 except Exception as exc:
                     print(f"[M3] Worker context compression failed: {exc}")
         return ctx
+
+    def _initialize_research_state(self) -> None:
+        """Create Strategy-2's deterministic coverage graph in shadow mode."""
+        if not self._config.research_state_enabled:
+            return
+        from ..planner.research_state import ResearchStateGraph
+
+        self._research_graph = ResearchStateGraph.from_subtasks(
+            self._query,
+            list(self._task_map.values()),
+            dag=self._dag,
+            budget_limit=max(
+                1,
+                self._config.max_sub_questions * (1 + self._config.max_replan_rounds),
+            ),
+            max_consecutive_actions=self._config.frontier_max_consecutive_action,
+            marginal_gain_threshold=self._config.frontier_marginal_gain_threshold,
+        )
+        self._decision_trace.append(DecisionRecord(
+            action="research_state_initialized",
+            signals={
+                "mode": "active" if self._config.research_state_active else "shadow",
+                "facets": sorted(self._research_graph.facets),
+                "budget_limit": self._research_graph.budget_limit,
+            },
+            reason="strategy2 facet graph initialized from executable DAG",
+            timestamp=time.time(),
+        ))
+
+    def _update_research_state_layer(
+        self,
+        results: list[AgentResult],
+        layer_idx: int,
+    ) -> None:
+        """Update facet coverage at a DAG barrier and trace the best frontier.
+
+        The first implementation is deliberately shadow-only: it observes the
+        exact production execution and never adds calls or changes DAG order.
+        """
+        graph = self._research_graph
+        if graph is None:
+            return
+        for result in results:
+            task = self._task_map.get(result.task_id)
+            if task is None:
+                continue
+            facet_id = task.facet_id or task.task_id
+            self._facet_task_outcomes.setdefault(facet_id, {})[task.task_id] = result
+
+        for facet_id, outcomes in sorted(self._facet_task_outcomes.items()):
+            if facet_id not in graph.facets:
+                continue
+            expected = [
+                task for task in self._task_map.values()
+                if (task.facet_id or task.task_id) == facet_id
+            ]
+            successes = [r for r in outcomes.values() if r.status == AgentStatus.SUCCESS]
+            coverage = len(successes) / max(len(expected), 1)
+            support = (
+                sum(max(0.0, min(1.0, r.confidence)) for r in successes) / len(successes)
+                if successes else 0.0
+            )
+            clusters = {
+                cluster for result in successes
+                for cluster in self._result_source_clusters(result)
+            }
+            graph.update_facet(
+                facet_id,
+                coverage=coverage,
+                support=support,
+                source_diversity=min(1.0, len(clusters) / 2.0),
+            )
+
+        selected = graph.choose_action(commit=False)
+        gate = graph.stop_gate()
+        self._decision_trace.append(DecisionRecord(
+            action="frontier_shadow",
+            signals={
+                "layer": layer_idx + 1,
+                "selected_action": selected.action.value,
+                "target_id": selected.target_id,
+                "estimated_value": round(selected.value, 6),
+                "candidates": graph.frontier_scores(),
+                "stop_gate": gate,
+            },
+            reason=selected.reason,
+            timestamp=time.time(),
+        ))
+
+    def _extend_research_state(self) -> None:
+        """Merge replan facets into the existing episode without losing state."""
+        graph = self._research_graph
+        if graph is None:
+            return
+        from ..planner.research_state import ResearchStateGraph
+
+        addition = ResearchStateGraph.from_subtasks(
+            self._query,
+            list(self._task_map.values()),
+            dag=self._dag,
+            budget_limit=graph.budget_limit,
+        )
+        for facet_id, facet in addition.facets.items():
+            if facet_id not in graph.facets:
+                graph.add_facet(facet)
+                continue
+            current = graph.facets[facet_id]
+            current.expected_questions = sorted(set(
+                current.expected_questions + facet.expected_questions
+            ))
+            current.dependencies = sorted(set(current.dependencies + facet.dependencies))
+        for claim_id, claim in addition.claims.items():
+            if claim_id not in graph.claims:
+                graph.add_claim(claim)
+        for question_id, question in addition.open_questions.items():
+            if question_id not in graph.open_questions:
+                graph.add_open_question(question)
+
+    @staticmethod
+    def _result_source_clusters(result: AgentResult) -> set[str]:
+        bundle = result.evidence_bundle if isinstance(result.evidence_bundle, dict) else {}
+        sources = bundle.get("sources", []) if isinstance(bundle, dict) else []
+        clusters = {
+            str(source.get("source_cluster_id") or source.get("domain_cluster") or source.get("url") or "")
+            for source in sources
+            if isinstance(source, dict) and (
+                source.get("source_cluster_id") or source.get("domain_cluster") or source.get("url")
+            )
+        }
+        if clusters:
+            return clusters
+        return {
+            str(source.get("url", ""))
+            for source in Orchestrator._extract_sources(result)
+            if source.get("url")
+        }
 
     def _compress_results_for_context(self, results: list[AgentResult]) -> list[AgentResult]:
         """Compress synthesis inputs without mutating canonical AgentResults."""

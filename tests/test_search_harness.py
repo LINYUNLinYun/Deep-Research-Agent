@@ -71,6 +71,27 @@ def test_search_controller_rewrites_similar_queries_with_hints():
     assert result["rewritten_query"] == tool.calls[1]
 
 
+def test_search_event_retains_strategy2_frontier_metadata():
+    tool = _Search([[{"title": "A", "url": "https://example.com/a", "snippet": "one"}]])
+    controller = SearchController()
+    asyncio.run(controller.execute(
+        tool,
+        {"query": "evidence"},
+        context={
+            "facet_id": "safety",
+            "claim_ids": ["claim_1"],
+            "source_cluster_ids": ["domain:example.com"],
+            "action": "cross_validate",
+            "estimated_value": 0.7,
+        },
+    ))
+    event = controller.snapshot()["events"][0]
+    assert event["facet_id"] == "safety"
+    assert event["claim_ids"] == ["claim_1"]
+    assert event["action"] == "cross_validate"
+    assert event["estimated_value"] == 0.7
+
+
 def test_search_controller_rewrites_an_empty_first_query():
     tool = _Search([
         [],

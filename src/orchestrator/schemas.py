@@ -89,6 +89,12 @@ class SubTask:
     priority: int = 1
     expected_type: str = "factual"  # factual | analytical | comparative | temporal
     search_hints: list[str] = field(default_factory=list)
+    # Strategy 2 coverage-graph metadata. These fields are optional so legacy
+    # DAG plans and replay fixtures remain valid.
+    facet_id: str = ""
+    claim_ids: list[str] = field(default_factory=list)
+    completion_criteria: list[str] = field(default_factory=list)
+    risk_question: str = ""
 
 
 @dataclass
@@ -145,6 +151,7 @@ class ResearchReport:
     claim_evidence_edges: list[dict[str, Any]] = field(default_factory=list)
     open_questions: list[dict[str, Any]] = field(default_factory=list)
     evidence_verification: dict[str, Any] = field(default_factory=dict)
+    research_state: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -214,3 +221,7 @@ class RunConfig:
     token_budget: int = 100_000
     evidence_replan_threshold: float = 0.6
     evidence_replan_max_tasks: int = 3
+    research_state_enabled: bool = False
+    research_state_active: bool = False
+    frontier_marginal_gain_threshold: float = 0.15
+    frontier_max_consecutive_action: int = 2

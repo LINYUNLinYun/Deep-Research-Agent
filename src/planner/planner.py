@@ -127,12 +127,14 @@ class Planner:
         budget_tracker: BudgetTracker | None = None,
         max_tasks: int = 8,
         max_attempts: int = 3,
+        facet_planning_enabled: bool = False,
     ) -> None:
         self.policy = policy
         self.budget_tracker = budget_tracker or BudgetTracker()
         self._last_raw_json: str = ""
         self.max_attempts = max(1, int(max_attempts))
         self.max_tasks = max(1, min(int(max_tasks), 8))
+        self.facet_planning_enabled = bool(facet_planning_enabled)
 
     # ------------------------------------------------------------------
     # 公共 API
@@ -214,6 +216,11 @@ class Planner:
             preserved_results_json=preserved_json,
             reason=reason,
         )
+        if self.facet_planning_enabled:
+            prompt += (
+                "\nPreserve or add facet_id, completion_criteria, risk_question, and claim_ids on every new sub_task. "
+                "Reuse an existing facet_id when the task deepens the same aspect; do not expand the task budget."
+            )
         messages = [
             {"role": "system", "content": f"{runtime_context_text()}\n\nYou are a research planning assistant. Output valid JSON only."},
             {"role": "user", "content": prompt},
@@ -243,11 +250,21 @@ class Planner:
                 "Use the preserved successful results above to inform new sub-tasks. "
                 "New tasks should fill gaps and avoid duplicating existing coverage."
             )
-        return INITIAL_PLAN_PROMPT.format(
+        prompt = INITIAL_PLAN_PROMPT.format(
             query=resolve_relative_dates(query),
             memory_context=memory or "None",
             runtime_context=runtime_context_text(),
         ) + extra_hint
+        if self.facet_planning_enabled:
+            prompt += (
+                "\n## Coverage graph metadata\n"
+                "Partition the question into distinct perspectives/facets. Every sub_task must also include: "
+                "facet_id (stable snake_case label), completion_criteria (one or more verifiable outcomes), "
+                "risk_question (a counterargument, failure mode, or evidence limitation), and claim_ids (possibly empty). "
+                "Cover core facts, mechanism, limitations/counterevidence, temporal scope, and stakeholders when relevant. "
+                "Do not increase the number of sub_tasks or the search budget.\n"
+            )
+        return prompt
 
     def _generate_with_retry(self, messages: list[dict], phase: str) -> DAG:
         """Call the planner a bounded number of times with concise correction."""
@@ -385,6 +402,16 @@ class Planner:
 
     def _deserialize_subtask(self, item: dict[str, Any]) -> SubTask:
         """将 JSON dict 反序列化为 SubTask。"""
+        def string_list(value: Any) -> list[str]:
+            # LLMs occasionally emit a scalar for a schema field declared as
+            # an array. ``list("text")`` silently turns it into characters,
+            # which polluted Strategy 2 coverage criteria and prompts.
+            if isinstance(value, str):
+                return [value] if value.strip() else []
+            if not isinstance(value, (list, tuple, set)):
+                return []
+            return [str(entry) for entry in value if str(entry).strip()]
+
         task_type_str = item.get("task_type", "search")
         try:
             task_type = TaskType(task_type_str)
@@ -395,12 +422,16 @@ class Planner:
             task_id=item.get("task_id", "unknown"),
             task_type=task_type,
             description=item.get("description", ""),
-            dependencies=list(item.get("dependencies", [])),
-            context_keys=list(item.get("context_keys", [])),
+            dependencies=string_list(item.get("dependencies", [])),
+            context_keys=string_list(item.get("context_keys", [])),
             timeout_seconds=int(item.get("timeout_seconds", 120)),
             priority=int(item.get("priority", 1)),
             expected_type=item.get("expected_type", "factual"),
-            search_hints=list(item.get("search_hints", [])),
+            search_hints=string_list(item.get("search_hints", [])),
+            facet_id=str(item.get("facet_id", "") or ""),
+            claim_ids=string_list(item.get("claim_ids", [])),
+            completion_criteria=string_list(item.get("completion_criteria", [])),
+            risk_question=str(item.get("risk_question", "") or ""),
         )
 
     def get_task_map_from_dag(self, dag: DAG, raw_json: str) -> dict[str, SubTask]:

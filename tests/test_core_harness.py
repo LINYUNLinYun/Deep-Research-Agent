@@ -299,3 +299,57 @@ def test_claim_evidence_edges_are_persisted_with_stable_source_ids() -> None:
     assert summary["supported"] == 1
     assert report.claim_evidence_edges[0]["source_id"] == "src_stats"
     assert report.claim_evidence_edges[0]["relation"] == "supported"
+
+
+def test_strategy2_shadow_graph_updates_grouped_facet_at_layer_barrier() -> None:
+    orch, _ = _orchestrator_for_dependency_test()
+    orch._query = "Compare benefits and risks"
+    orch._config = RunConfig(
+        research_state_enabled=True,
+        research_state_active=False,
+        max_sub_questions=4,
+        max_replan_rounds=1,
+    )
+    orch._dag = DAG()
+    orch._dag.add_node("benefit_search")
+    orch._dag.add_node("benefit_verify")
+    orch._task_map = {
+        "benefit_search": SubTask(
+            "benefit_search", TaskType.SEARCH, "Find benefit evidence",
+            facet_id="benefits", completion_criteria=["one supported benefit"],
+        ),
+        "benefit_verify": SubTask(
+            "benefit_verify", TaskType.VERIFY, "Verify benefit evidence",
+            facet_id="benefits", completion_criteria=["one independent source"],
+        ),
+    }
+    orch._initialize_research_state()
+    result = AgentResult(
+        "benefit_search", AgentStatus.SUCCESS, output="supported", confidence=0.8,
+        evidence_bundle={"sources": [{"domain_cluster": "example.com"}]},
+    )
+    orch._update_research_state_layer([result], 0)
+
+    facet = orch._research_graph.facets["benefits"]
+    assert facet.coverage == 0.5
+    assert facet.support == 0.8
+    assert orch._decision_trace[-1].action == "frontier_shadow"
+    assert orch._decision_trace[-1].signals["layer"] == 1
+
+
+def test_strategy2_metadata_reaches_search_context() -> None:
+    orch, _ = _orchestrator_for_dependency_test()
+    task = SubTask(
+        "risk_search", TaskType.SEARCH, "Find counterevidence", facet_id="risks"
+    )
+    orch._task_map = {task.task_id: task}
+    orch._dag = DAG()
+    orch._dag.add_node(task.task_id)
+    orch._query = "question"
+    orch._config = RunConfig(research_state_enabled=True)
+    orch._initialize_research_state()
+
+    context = orch._build_task_context(task)
+    assert context["facet"] == "Find counterevidence"
+    assert context["frontier_action"] == "search_new_facet"
+    assert isinstance(context["frontier_estimated_value"], float)

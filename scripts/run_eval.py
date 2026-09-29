@@ -406,6 +406,11 @@ def main() -> None:
         action="store_true",
         help="关闭 claim-level Numeric Verification（用于无 Numeric 的隔离 baseline）",
     )
+    parser.add_argument(
+        "--research-state-shadow",
+        action="store_true",
+        help="启用策略二 coverage/frontier graph 的 shadow trace，不改变 DAG 调度",
+    )
     parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -415,6 +420,10 @@ def main() -> None:
     config = load_config(args.config)
     if args.no_numeric_verification:
         config.setdefault("adversarial", {})["evidence_verification_enabled"] = False
+    if args.research_state_shadow:
+        state_cfg = config.setdefault("planner", {}).setdefault("research_state", {})
+        state_cfg["enabled"] = True
+        state_cfg["active"] = False
     logger.info(f"配置加载完成: {args.config or 'configs/default.yaml'}")
 
     if args.benchmark == "research_bench" and args.dataset_manifest:

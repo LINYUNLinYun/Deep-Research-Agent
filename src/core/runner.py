@@ -276,6 +276,7 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         budget_tracker=budget_tracker,
         max_tasks=config.get("orchestrator", {}).get("max_sub_questions", 8),
         max_attempts=config.get("planner", {}).get("max_parse_attempts", 3),
+        facet_planning_enabled=config.get("planner", {}).get("research_state", {}).get("enabled", False),
     )
     modules["planner"] = planner
     logger.info("[M2] Planner 模块已初始化")
@@ -455,6 +456,8 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         memory_store=memory_store,
         summarizer_policy=modules.get("summarizer_policy", default_policy),
         evidence_verifier=evidence_verifier,
+        max_catalog_sources=config.get("summarizer", {}).get("max_catalog_sources", 24),
+        max_catalog_chars=config.get("summarizer", {}).get("max_catalog_chars", 12000),
     )
     modules["orchestrator"] = orchestrator
     logger.info("[M1] Orchestrator 模块已初始化")
@@ -529,6 +532,10 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
         token_budget=config.get("orchestrator", {}).get("token_budget", 100000),
         evidence_replan_threshold=config.get("planner", {}).get("evidence_replan_threshold", 0.6),
         evidence_replan_max_tasks=config.get("planner", {}).get("evidence_replan_max_tasks", 3),
+        research_state_enabled=config.get("planner", {}).get("research_state", {}).get("enabled", False),
+        research_state_active=config.get("planner", {}).get("research_state", {}).get("active", False),
+        frontier_marginal_gain_threshold=config.get("planner", {}).get("research_state", {}).get("marginal_gain_threshold", 0.15),
+        frontier_max_consecutive_action=config.get("planner", {}).get("research_state", {}).get("max_consecutive_action", 2),
     )
 
     report = await orchestrator.run(query, config=run_cfg)
@@ -579,6 +586,7 @@ def collect_harness_telemetry(modules: dict[str, Any]) -> dict[str, Any]:
         "agent_pool": modules["agent_pool"].get_stats() if modules.get("agent_pool") else {},
         "decision_trace": list(getattr(report, "decision_trace", []) or []),
         "evidence_verification": dict(getattr(report, "evidence_verification", {}) or {}),
+        "research_state": dict(getattr(report, "research_state", {}) or {}),
         "skills": {
             "verify_numeric_claim_skill": {
                 **skill_artifact,
