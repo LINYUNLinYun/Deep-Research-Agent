@@ -1,316 +1,232 @@
-<div align="center">
+# Deep Research Agent
 
-# 🚀 DeepResearch Agent
+Deep Research Agent 是一个用于长链路研究任务的 Python 实验框架。它把问题拆成 DAG，
+并发调用检索与分析 Agent，保留来源和证据关系，再生成带引用的 Markdown 报告。
 
-### *从复杂 Query 到结构化深度研究报告，全链路自动化*
+这个项目目前更适合作为研究与评测代码库，而不是开箱即用的生产服务。我们关心的重点是：
+研究过程能否追踪、预算能否控制、失败能否复现，以及一项策略是否真的通过了对照实验。
 
-[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Async](https://img.shields.io/badge/Async-asyncio-orange.svg)](https://docs.python.org/3/library/asyncio.html)
+> 当前状态：Alpha。实时搜索结果会受供应商、时间和网络状态影响；实验性策略默认关闭。
+> 仓库不会把“代码已实现”等同于“质量已经提升”。
 
-</div>
+## 主要能力
 
----
+- **DAG 研究编排**：Planner 将问题拆成有依赖关系的子任务，Orchestrator 按拓扑层并发执行；失败、超时和证据不足可以触发有界重规划。
+- **证据链路**：检索结果写入 lossless Evidence Ledger，使用稳定 source ID 连接来源、claim 和最终引用；模型侧只接收有数量与字符上限的证据目录。
+- **搜索预算控制**：区分单任务限额和整次运行限额，记录 query rewrite、provider fallback、重复率和调用量等 telemetry。
+- **报告校验与修复**：可选的 claim-level 证据验证会标记 supported、unsupported 和 conflict；Red/Blue 流程用于发现问题并做受限修复。
+- **多后端模型路由**：Planner、Researcher、Summarizer、Judge 等模块可以分别选择 DeepSeek、MiMo、OpenAI 兼容接口或本地 vLLM。
+- **评测与消融**：包含 ResearchBench、HotpotQA 适配、规则指标、LLM Judge、paired evaluation、bootstrap 置信区间和模块消融脚本。
 
-## 📖 项目背景
+## 最近加入的实验能力
 
-大语言模型在单一问答场景表现优异，但在**复杂深度研究任务**中面临三个核心挑战：
+### Research State shadow controller
 
-1. 🔥 **信息爆炸与上下文遗忘** —— 长文本检索后关键信息淹没在噪声中，模型难以聚焦
-2. 👻 **幻觉与事实漂移** —— 多轮推理过程中，模型倾向于"编造"未经验证的事实
-3. 📊 **缺乏系统性评估** —— 现有评测多以单轮 QA 为主，缺少对"深度研究报告"这一输出形态的端到端评价体系
+`ResearchStateGraph` 在执行 DAG 之外维护另一层研究状态：facet、claim、未解决问题、
+来源多样性和冲突。它能对下面这些动作做确定性评分：
 
-本项目从零构建了一套**面向深度研究任务的 Agent 系统**，覆盖规划、执行、记忆、对抗、进化、评测全链路。
+- `search_new_facet`
+- `deepen_claim`
+- `open_primary_source`
+- `cross_validate`
+- `resolve_conflict`
+- `stop`
 
----
+状态可以序列化和重放，frontier 的候选分数与 stop gate 会写入 telemetry。
 
-## 🎯 实验动机
-
-> **"如果一个 Agent 只能回答简单问题，那它和搜索引擎有什么区别？"**
-
-我们的动机是：**让 AI 真正具备"深度研究"的能力**——不只是检索信息，而是像人类研究员一样：
-- 🧩 **拆解复杂问题** → 将模糊的研究目标分解为可执行的子任务
-- 🔍 **多源信息整合** → 从网页、论文、数据库等多渠道收集证据
-- ⚖️ **批判性审视** → 主动发现并修正报告中的错误和偏见
-- 📝 **结构化输出** → 生成带引用、有逻辑、可验证的研究报告
-
----
-
-## 💡 解决方法
-
-### 六大模块协同工作
-
-| 模块 | 职责 | 核心技术 |
-|------|------|---------|
-| 🎛️ **M1 Orchestrator** | 多智能体编排与调度 | 自研 asyncio + DAG 执行引擎，9 状态状态机 |
-| 🗺️ **M2 Planner** | 复杂问题拆解 | JSON DAG 动态规划，支持执行中 replan |
-| 🗜️ **M3 Compressor** | 长上下文压缩 | Embedding 语义三级过滤 + TextRank 关键句提取 |
-| 🧠 **M4 Memory Store** | 跨 Agent 共享记忆 | SQLite + numpy 向量索引，去重/矛盾检测/LRU 淘汰 |
-| ⚔️ **M5 Adversarial Loop** | 对抗降噪 | Red-Blue 循环攻击-修复，内置收敛与震荡检测 |
-| 🧬 **M6 Evolution Engine** | 在线自进化 | GRPO 强化学习 + 符号规则学习（预留接口） |
-
-### 数据流全景
-
-```raw
-用户 Query
-    ↓
-🗺️ Planner 拆解为 DAG 子任务图
-    ↓
-🎛️ Orchestrator 按拓扑排序并发调度
-    ↓
-🤖 Worker Agents 调用 🔍 搜索 / 📄 论文 / 🌐 网页 工具
-    ↓
-🧠 每个 DAG 层完成后写入 Memory，供下游依赖消费
-    ↓
-🗜️ Compressor 按预算压缩 Worker / Replan / Summarizer 上下文
-    ↓
-📝 Summarizer 合成 Markdown 报告
-    ↓
-🔎 Claim–Evidence 验证；证据缺口可触发局部 replan
-    ↓
-⚔️ Red Agent 攻击 → Blue Agent 修复 → 修复后重新评分
-    ↓
-📤 输出带元信息的结构化研究报告
-```
-
----
-
-## ✨ 项目精彩之处
-
-### 🏗️ 1. 自研编排引擎，不依赖 LangGraph/AutoGen
-
-> 为什么不用现成的框架？因为深度研究任务需要**完全可控的调度逻辑**。
-
-- 基于 `asyncio` + `Semaphore` 实现 **DAG 拓扑并发执行**
-- **9 状态状态机**：IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → ADVERSARIAL → DONE
-- **状态驱动降级**：综合失败比例、依赖影响、证据新颖度与预算决定 replan；全局超时用已有证据强制合成
-
-### ⚔️ 2. Red-Blue 对抗降噪 —— 主动抑制幻觉
-
-> 灵感来自 GAN 的对抗训练思想，但应用于**文本质量优化**。
-
-- **Red Agent** 从 5 个维度攻击报告：事实性、逻辑一致性、引用质量、覆盖面、时效性
-- **Blue Agent** 执行 4 种修复操作：ADD / DELETE / MODIFY / VERIFY
-- **收敛控制**：评分达标（≥8.0）/ 变化收敛（Δ < 0.3）/ 轮数上限（3 轮）三选一终止
-- **震荡检测**：已修复问题重新出现 → 判定震荡 → 优雅终止
-
-### 🗜️ 3. 语义级上下文压缩 —— 不是简单截断
-
-> 关键词匹配会丢失语义，简单截断会丢失关键信息。**我们用 Embedding 做语义压缩**。
-
-- **L1 粗过滤**：cosine similarity < 0.6 丢弃，> 0.95 完整保留
-- **L2 细筛选**：TextRank + Query-Biased 提取关键句
-- **L3 精保留**：高度相关内容保留原文，避免摘要失真
-
-### 🧠 4. 跨 Agent 共享记忆 —— 会"反思"的系统
-
-- 写前自动**去重**（cosine > 0.92）
-- **矛盾检测**：启发式反义词 + 语义对立识别
-- 三种**矛盾消解策略**：Majority Vote / Source Weight / LLM Judge
-- **Session 隔离**：不同用户/会话的记忆物理隔离
-
-### 🔌 5. 多后端 LLM 路由 —— 零源码切换模型
-
-```yaml
-# configs/default.yaml
-model:
-  backend_mapping:
-    solver: "deepseek"      # 强推理
-    planner: "deepseek"     # 结构化输出
-    red_agent: "mimo"       # 稳定、低成本
-    blue_agent: "mimo"
-    judge: "mimo"
-    compressor: "mimo"
-```
-
-- 支持 DeepSeek / MiMo 2.5 Pro / vLLM / OpenAI **热切换**
-- 模块级采样参数集中管理，**避免配置漂移**
-- `.env` 驱动，**零源码修改**接入新后端
-
-### 📊 6. 完整的深度研究评测体系
-
-> 不做"跑几个例子看看"的评测，做**可复现、可量化、有统计显著性**的评测。
-
-| 评测层级 | 方法 | 特点 |
-|---------|------|------|
-| 📏 **规则指标** | 事实准确率 / 幻觉率 / 引用覆盖率 / 逻辑一致性 | 免费、可复现、零 API 成本 |
-| 📚 **公共数据集** | HotpotQA 多跳 QA 深度研究变体 | 传统 EM/F1 + 新增语义覆盖度 |
-| 🏗️ **自建评测集** | ResearchBench 35 题 × 11 领域 | 含 expected_topics + ground_truth |
-| 👨‍⚖️ **LLM-as-Judge** | MiMo 5 维度 0-10 分深度评分 | 定性+定量互补 |
-| 🥊 **Head-to-Head** | Agent vs 单轮 LLM 直接对比 | pairwise 更可靠 |
-| 📈 **统计显著性** | Bootstrap 95% CI + Cohen's d + t-test | 拒绝"随机波动" |
-
----
-
-## 🚀 快速开始
-
-### 环境准备
+目前该能力处于 **shadow 阶段**：默认关闭；启用后只观察现有执行过程，不改写 DAG、
+不增加搜索调用，也不会提前终止研究。这样可以先验证决策轨迹，再考虑开放主动控制。
 
 ```bash
-# 1. 克隆项目
-git clone https://github.com/qiqihezh/deepresearch-agent.git
-cd deep_research_agent
-
-# 2. 创建 uv 虚拟环境并激活
-uv venv .venv
-source .venv/bin/activate
-
-# 3. 安装核心依赖
-pip install -r requirements.txt
-
-# 4. 配置 API Key（复制模板后填入）
-cp .env.example .env
-# 编辑 .env：填入 DEEPSEEK_API_KEY、BOCHA_API_KEY 等
+python scripts/run_eval.py \
+  --benchmark research_bench \
+  --num_questions 5 \
+  --research-state-shadow
 ```
 
-### 三种运行方式
+### 可审计的 Harness Evolution
 
-**🎯 单条 Query（单次深度研究）**
+仓库提供两条离线演化轨道：
+
+- `search_control_policy`：搜索决策、阈值和动作；
+- `verify_numeric_claim_skill`：数字、百分比、金额、单位和日期验证。
+
+候选产物采用版本化 YAML，并分别维护 `production`、`candidate` 和 `canary` registry。
+评测支持冻结 fixture、record/replay、held-out paired evaluation 和晋升门控。即使候选通过门控，
+也只有显式执行 `promote` 才会改变 production 指针。
+
+这套机制的目标是让策略变更可比较、可回滚，而不是宣称系统已经可以自主提升质量。
+现有实验尚未证明策略一或 Research State shadow 相对 baseline 有稳定收益，详见
+[实验记录](docs/2026-09-14.md)。
+
+## 处理流程
+
+```text
+Query
+  -> Planner 生成 DAG
+  -> Orchestrator 分层并发执行 Worker
+  -> Web / Paper / Browser 工具收集来源
+  -> Evidence Ledger 固化 provenance
+  -> Compressor 控制上下文预算
+  -> Summarizer 生成报告与引用
+  -> Claim-Evidence 验证；必要时局部 replan
+  -> 可选 Red/Blue 审查与修复
+  -> Report + telemetry
+```
+
+Research State shadow、Search Controller 和 Harness Registry 都围绕这条主链路工作，
+但不会绕过现有的预算和晋升边界。
+
+## 快速开始
+
+### 1. 安装
+
+要求 Python 3.10 或更高版本。
+
+```bash
+git clone https://github.com/LINYUNLinYun/Deep-Research-Agent.git
+cd Deep-Research-Agent
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+也可以使用 `uv venv` 创建环境。
+
+### 2. 配置模型和搜索服务
+
+```bash
+cp .env.template .env.local
+```
+
+在 `.env.local` 中填写实际使用的模型与搜索 provider 凭证。默认配置使用 DeepSeek 作为
+主要研究后端，并为部分模块配置 MiMo；搜索默认使用 Bocha。若要调整组合，请修改
+[`configs/default.yaml`](configs/default.yaml) 中的 `model.backend_mapping` 和 `tools` 配置。
+
+`.env.local` 已被 Git 忽略，不要把 API key 写入 YAML 或提交到仓库。
+
+### 3. 运行一次研究
+
 ```bash
 python scripts/run_single.py \
-    --query "2024-2025年大模型Agent技术趋势与落地案例研究" \
-    --config configs/default.yaml
+  --query "比较三种长上下文 Agent 的证据管理方法" \
+  --config configs/default.yaml
 ```
 
-**💬 交互式 REPL（支持 Session 继承与连续追问）**
+报告默认保存到 `outputs/reports/`。默认配置会调用多个外部服务，并可能产生 API 费用；
+正式批量运行前建议先检查并发数、搜索上限、模型映射和对抗轮数。
+
+### 4. 使用 REPL
+
 ```bash
-python scripts/run_repl.py
-# 交互命令: ls / sessions / save / q
+python scripts/run_repl.py --config configs/default.yaml
 ```
 
-**🔬 批量实验（全量评测体系，overnight 可跑完）**
+REPL 会在同一 session 中复用模块和记忆，支持 `sessions`、`ls`、`save` 和 `help`。
+
+## 配置入口
+
+主要配置集中在 [`configs/default.yaml`](configs/default.yaml)：
+
+| 配置段 | 用途 |
+| --- | --- |
+| `model.backend_mapping` | 为 planner、solver、summarizer、judge 等模块分配后端 |
+| `orchestrator` | 并发数、全局超时、子任务数量和重规划上限 |
+| `planner` | 规划重试、证据增益阈值和 Research State 开关 |
+| `compressor` | 上下文长度、输出保留量和多级压缩阈值 |
+| `memory` | SQLite 路径、session 隔离、去重和检索参数 |
+| `adversarial` | Red/Blue 轮数、超时、修复范围和证据验证 |
+| `summarizer` | 模型侧来源目录的数量与字符预算 |
+| `tools.search_control` | query 去重、rewrite 和 run-level provider 上限 |
+| `harness_evolution` | registry 位置与线上使用的策略版本 |
+
+## 评测
+
+先运行单元测试：
+
 ```bash
-python scripts/run_all_experiments.py \
-    --report_file outputs/reports1/report_xxx.md \
-    --report_query "你的研究问题"
+python -m pytest -q
 ```
 
-> 批量实验默认配置：模块消融 4×12 题 + 轮数消融 4×12 题 + 标准评测 35 题 + 领域对比 3×5 题 + Agent vs LLM 3 题 + Judge 1 次 = **153 次独立研究运行**
-
----
-
-## 📁 仓库结构
-
-## 🧬 冻结模型的 Harness 自进化 V1
-
-项目提供与旧 GRPO 占位模块隔离的两条离线进化轨道：
-
-- `search_control_policy`：版本化搜索决策、阈值和动作；
-- `verify_numeric_claim_skill`：数字、百分比、金额、单位和日期事实验证。
-
-Policy/Skill YAML 不可覆盖，`production`、`candidate`、`canary` Registry 分离并校验 SHA-256。候选必须先完成严格 replay 与 held-out paired evaluation；即使门控通过也不会自动发布，只有显式 `promote` 才能改变 production 指针。
+使用 HotpotQA 内置 mock 数据检查评测链路，不需要下载数据集：
 
 ```bash
-# 从 development/miner 评测产物提取失败经验
-python3 scripts/run_harness_evolution.py mine --input outputs/evaluation.json
+python scripts/run_eval.py \
+  --benchmark hotpotqa \
+  --use_mock \
+  --num_questions 3
+```
 
-# LLM 提出假设，程序枚举并创建一个受约束候选
-python3 scripts/run_harness_evolution.py propose --track policy --use-llm
+运行 ResearchBench 或消融实验：
 
-# Numeric Skill 的无网络 held-out 评测
-python3 scripts/run_harness_evolution.py evaluate --track skill
+```bash
+python scripts/run_eval.py --benchmark research_bench --num_questions 10
+python scripts/run_ablation.py --mode module --questions 10
+```
 
-# 生成可审阅报告；无显著提升会明确 reject
-python3 scripts/run_harness_evolution.py report \
+实时搜索的 A/B 结果容易受到 provider 熔断和时间顺序影响。需要比较策略时，优先使用冻结
+fixture，或者交替运行同题 baseline/candidate，并单独记录 provider failure。
+
+## Harness Evolution 工作流
+
+```bash
+# 从评测产物提取失败经验
+python scripts/run_harness_evolution.py mine \
+  --input outputs/evaluation/results.json
+
+# 生成受约束候选
+python scripts/run_harness_evolution.py propose \
+  --track policy \
+  --use-llm
+
+# 在 held-out 数据上评测；Policy 评测建议提供 --fixture-dir
+python scripts/run_harness_evolution.py evaluate \
+  --track skill \
+  --split held_out
+
+# 生成晋升建议
+python scripts/run_harness_evolution.py report \
   --experiment outputs/harness_evolution/<experiment_id>
 
-# 评审后手动晋升；不会自动执行
-python3 scripts/run_harness_evolution.py promote --decision <promotion_decision.json>
-
-# 历史版本仍保留，可显式回滚指针
-python3 scripts/run_harness_evolution.py rollback \
-  --artifact verify_numeric_claim_skill --version v0001
+# 人工确认后显式晋升
+python scripts/run_harness_evolution.py promote \
+  --decision <promotion_decision.json>
 ```
 
-搜索 Policy 的正式评测需要为每道题准备严格工具 fixture，并传入 `--fixture-dir`。未命中的工具请求会 fail-fast，不会回退到真实网络。
+没有匹配 fixture 的 Policy replay 会 fail-fast，不会偷偷回退到真实网络。
 
-仓库附带一次离线 Skill 候选实验：production=`v0001`、candidate=`v0002`，24 个 held-out pair 全部持平，因此 Promotion Gate 返回 reject。该结果用于证明隔离、追溯和“无提升不晋升”，不代表真实端到端质量已经提点；Search Policy 的付费模型 replay 质量仍需实验验证。
+## 仓库结构
 
-```raw
-deep_research_agent/
-├── 📁 configs/                    # YAML 配置中心
-│   ├── default.yaml               # 全局默认配置
-│   ├── agents/                    # Agent 行为配置
-│   ├── interaction_config/        # 交互层配置
-│   └── tool_config/               # 工具层配置
-│
-├── 📁 src/                        # 核心源码（~5000 行）
-│   ├── 📁 core/                   # 核心运行层
-│   │   ├── runner.py              # 初始化模块 + 执行完整研究流程
-│   │   ├── judge.py               # MiMo Judge 统一接口
-│   │   └── ablation.py            # 消融实验通用框架
-│   │
-│   ├── 📁 orchestrator/           # 🎛️ M1: 多智能体编排器
-│   ├── 📁 planner/                # 🗺️ M2: 自适应规划器
-│   ├── 📁 compressor/             # 🗜️ M3: 上下文压缩器
-│   ├── 📁 memory/                 # 🧠 M4: 共享记忆存储
-│   ├── 📁 adversarial/            # ⚔️ M5: 对抗降噪循环
-│   ├── 📁 evolution/              # 🧬 M6: 自进化引擎
-│   ├── 📁 harness_evolution/      # 🧬 Policy/Skill 版本、Replay 与晋升门控
-│   ├── 📁 agents/                 # 🤖 Agent 实现
-│   ├── 📁 models/                 # 🔌 模型路由层
-│   ├── 📁 tools/                  # 🛠️ 工具层
-│   └── 📁 utils/                  # 🧰 工具函数
-│
-├── 📁 evaluation/                 # 评测体系（~2000 行）
-│   ├── benchmarks/                # 评测集（ResearchBench / HotpotQA）
-│   ├── metrics/                   # 指标（规则 / Judge / 统计 / 综合）
-│   └── analyze_ablation.py        # 消融实验结果分析
-│
-├── 📁 scripts/                    # 可执行脚本
-│   ├── run_single.py              # 🎯 单条 query CLI
-│   ├── run_repl.py                # 💬 交互式 REPL
-│   ├── run_all_experiments.py     # 🔬 一键批量实验
-│   ├── run_ablation.py            # 消融实验独立入口
-│   ├── run_benchmark.py           # 🥊 Agent vs LLM
-│   ├── run_eval.py                # 标准评测入口
-│   ├── run_judge.py               # 👨‍⚖️ Judge 深度评分
-│   └── validate_env.py            # 环境配置检查
-│
-├── 📁 verl/                       # veRL 训练框架（GRPO）
-├── requirements.txt               # 依赖清单（分级安装）
-└── README.md                      # 📖 本文件
+```text
+configs/                    默认配置、Agent 配置、版本化 Policy/Skill
+evaluation/                 benchmark、指标和统计分析
+scripts/                    单次运行、评测、消融和演化 CLI
+src/agents/                 Researcher 与 Summarizer
+src/orchestrator/           状态机、DAG 调度和结果汇总
+src/planner/                Planner、预算追踪和 ResearchStateGraph
+src/evidence/               Evidence Ledger、schema 和 claim verifier
+src/adversarial/            Red/Blue 审查与修复
+src/harness_evolution/      registry、replay、candidate 和 promotion gate
+src/memory/                 session memory 与向量检索
+src/models/                 模型路由和 vLLM 策略
+src/tools/                  搜索、浏览、论文和本地工具
+tests/                      单元与回归测试
 ```
 
----
+更细的模块说明见 [`ARCHITECTURE.md`](ARCHITECTURE.md)。近期实验与设计取舍记录在
+[`docs/`](docs/) 目录。
 
-## 🛠️ 技术栈
+## 已知限制
 
-| 层级 | 技术 |
-|------|------|
-| 🐍 语言 | Python 3.11 |
-| ⚡ 异步框架 | asyncio |
-| 🧠 LLM 后端 | DeepSeek API / MiMo 2.5 Pro / vLLM / OpenAI |
-| 🔢 嵌入模型 | sentence-transformers (`all-MiniLM-L6-v2`) |
-| 💾 持久化 | SQLite + numpy 向量索引 |
-| 🎓 训练框架 | veRL (GRPO) |
-| 🔭 可观测性 | LangSmith |
-| 📦 虚拟环境 | uv |
+- 这是研究代码，配置和接口仍可能变化。
+- 引用与 claim verifier 能提高可追踪性，但不能保证来源本身正确，也不能替代人工核查。
+- Red/Blue 修复会增加模型调用，是否提升最终质量取决于模型、问题和证据质量。
+- Research State 目前只做 shadow 观测，尚未接管 follow-up DAG 或停止决策。
+- Harness Evolution 是离线、受门控的策略迭代，不是在线自动训练系统。
+- 使用实时 provider 的实验无法天然复现；严肃比较需要固定数据、fixture 和运行顺序。
 
----
+## 参与开发
 
-## 🗺️ Roadmap
-
-- [x] 自研编排引擎（asyncio + DAG）
-- [x] Red-Blue 对抗降噪
-- [x] 语义级上下文压缩
-- [x] 跨 Agent 共享记忆
-- [x] 多后端 LLM 路由
-- [x] 完整评测体系（规则 + Judge + 统计显著性）
-- [x] REPL 交互式会话
-- [ ] 实验结果填充（进行中 🔥）
-- [ ] Web UI（Gradio/Streamlit）
-- [ ] 用户反馈闭环
-- [ ] 多模态支持（图像/表格）
-
----
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 PR！无论是 bug 修复、功能增强还是文档改进，我们都非常感谢。
-
----
-
-## 📄 License
-
-[MIT](LICENSE) © 2025 DeepResearch Agent Contributors
+欢迎提交 Issue 或 PR。对于行为变更，请同时提供回归测试；对于声称提升质量的策略，
+请附 baseline、candidate、数据切分、失败样本和统计结果。
