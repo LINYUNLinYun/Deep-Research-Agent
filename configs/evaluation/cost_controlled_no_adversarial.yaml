@@ -92,6 +92,11 @@ planner:
   evidence_gain_threshold: 0.15
   evidence_gain_patience: 1
   max_tool_calls_per_subagent: 6
+  research_state:
+    enabled: false
+    active: false
+    marginal_gain_threshold: 0.15
+    max_consecutive_action: 2
 
 compressor:
   enabled: true
@@ -150,6 +155,10 @@ harness_evolution:
   # selected explicitly by the offline evolution CLI.
   registry: production
 
+summarizer:
+  max_catalog_sources: 24
+  max_catalog_chars: 12000
+
 tools:
   search_control:
     enabled: true
@@ -158,6 +167,7 @@ tools:
     query_similarity_threshold: 0.82
     novelty_threshold: 0.15
     max_rewrites: 1
+    max_backend_calls_per_run: 128
   execution:
     retry_delay: 0.5
     max_retry_delay: 8.0

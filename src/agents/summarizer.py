@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 from .base_agent import BaseAgent
@@ -31,8 +32,18 @@ class SummarizerAgent(BaseAgent):
         max_output_tokens: 报告生成的最大 token 数（通过 policy.max_tokens 控制）。
     """
 
-    def __init__(self, name: str, policy, tools: list | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        policy,
+        tools: list | None = None,
+        *,
+        max_catalog_sources: int = 24,
+        max_catalog_chars: int = 12_000,
+    ) -> None:
         super().__init__(name, policy, tools)
+        self.max_catalog_sources = max(1, int(max_catalog_sources))
+        self.max_catalog_chars = max(1_000, int(max_catalog_chars))
 
     @trace_agent(name="summarizer.run", tags=["agent", "summarizer"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
@@ -66,7 +77,7 @@ class SummarizerAgent(BaseAgent):
             )
 
         # 构建 synthesis prompt
-        source_catalog = context.get("source_catalog") or self._collect_sources(query, results)
+        source_catalog = context.get("source_catalog") or self.collect_sources(query, results)
         prompt = self._build_synthesis_prompt(
             query, results, source_catalog, prior_report=context.get("prior_report")
         )
@@ -163,14 +174,14 @@ class SummarizerAgent(BaseAgent):
                 f"{prior_report.content}\n"
             )
 
-        source_catalog = source_catalog if source_catalog is not None else self._collect_sources(query, results)
+        source_catalog = source_catalog if source_catalog is not None else self.collect_sources(query, results)
         parts.append(f"\n# Source Catalog ({len(source_catalog)} sources)\n")
         for source in source_catalog:
             parts.append(
                 f"[{source['citation_id']}] {source.get('title', '')}\n"
                 f"Stable source ID: {source.get('source_id', '')}\n"
                 f"URL: {source.get('url', '')}\n"
-                f"Evidence span: {str(source.get('source_span') or source.get('snippet', ''))[:800]}\n"
+                f"Evidence span: {str(source.get('source_span') or source.get('snippet', ''))}\n"
             )
 
         parts.append(
@@ -214,7 +225,7 @@ class SummarizerAgent(BaseAgent):
         confidence = llm_confidence * (success_rate ** 0.5)
         confidence = round(max(0.0, min(1.0, confidence)), 2)
 
-        unique_sources = source_catalog if source_catalog is not None else self._collect_sources(query, results)
+        unique_sources = source_catalog if source_catalog is not None else self.collect_sources(query, results)
 
         # Do not present stale evidence as a high-confidence current answer.
         is_temporal_query = any(token in query.lower() for token in ("今年", "当前", "目前", "最新", "近期", "最近", "this year", "current", "latest", "recent"))
@@ -247,16 +258,60 @@ class SummarizerAgent(BaseAgent):
             source_catalog=list(unique_sources),
         )
 
-    def _collect_sources(self, query: str, results: list[AgentResult]) -> list[dict]:
-        """Build a bounded, stable and source-diverse citation catalog."""
+    def collect_sources(self, query: str, results: list[AgentResult]) -> list[dict]:
+        """Build a stable catalog bounded by both source count and prompt size.
+
+        The ledger is deliberately lossless, while the model-facing catalog is
+        not.  Passing every retrieved span to synthesis caused prompt
+        truncation and reduced citation coverage in the first live ablation.
+        """
         successful = [result for result in results if result.status == AgentStatus.SUCCESS]
-        max_sources = min(40, max(12, len(successful) * 4))
-        sources = EvidenceLedger(max_sources_per_task=12).catalog(successful)[:max_sources]
+        max_sources = min(self.max_catalog_sources, max(8, len(successful) * 3))
+        sources = EvidenceLedger(max_sources_per_task=8).catalog(successful)
+        sources.sort(key=self._source_priority, reverse=True)
+        bounded: list[dict] = []
+        used_chars = 0
         for source in sources:
+            item = dict(source)
+            # A compact attributable passage is more useful than a long
+            # low-ranked snippet. Preserve the full span in the EvidenceBundle.
+            span = str(item.get("source_span") or item.get("snippet", ""))[:500]
+            item["source_span"] = span
+            item["snippet"] = str(item.get("snippet", ""))[:300]
+            entry_chars = sum(len(str(item.get(key, ""))) for key in (
+                "title", "url", "source_id", "source_span"
+            )) + 80
+            if used_chars + entry_chars > self.max_catalog_chars:
+                continue
+            bounded.append(item)
+            used_chars += entry_chars
+            if len(bounded) >= max_sources:
+                break
+        sources = bounded
+        for citation_id, source in enumerate(sources, 1):
+            source["citation_id"] = citation_id
             source_date = infer_source_date(source)
             source["source_date"] = source_date
             source["temporal_relevance"] = self._temporal_relevance(query, source_date)
         return sources
+
+    # Backwards-compatible alias used by older tests/callers.
+    def _collect_sources(self, query: str, results: list[AgentResult]) -> list[dict]:
+        return self.collect_sources(query, results)
+
+    @staticmethod
+    def _source_priority(source: dict) -> tuple[int, int, int]:
+        """Prefer attributable primary/authoritative sources deterministically."""
+        url = str(source.get("url", "")).lower()
+        authoritative = int(any(token in url for token in (
+            ".gov", ".edu", "who.int", "un.org", "oecd.org", "worldbank.org",
+            "arxiv.org", "doi.org", "nature.com", "science.org", "acm.org",
+            "ieee.org", "openai.com", "anthropic.com", "google.com",
+        )))
+        has_span = int(bool(str(source.get("source_span") or source.get("snippet", "")).strip()))
+        # Keep ordering stable across runs when quality signals tie.
+        citation = int(source.get("citation_id", 0) or 0)
+        return authoritative, has_span, -citation
 
     @staticmethod
     def _temporal_relevance(query: str, source_date: str | None) -> str:

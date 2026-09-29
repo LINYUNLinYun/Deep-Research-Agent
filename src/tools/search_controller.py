@@ -97,6 +97,11 @@ class SearchController:
         self._seen_content: set[str] = set()
         self._policy_decisions: list[dict[str, Any]] = []
         self._search_events: list[dict[str, Any]] = []
+        # The controller is shared by all workers in a research run.  Policy
+        # search-attempt limits therefore need a task-local counter; applying
+        # them to ``stats.backend_calls`` would let the first worker exhaust
+        # the allowance for every other task.
+        self._task_backend_calls: dict[str, int] = {}
         self.stats = SearchControlStats()
 
     # ------------------------------------------------------------------
@@ -160,7 +165,7 @@ class SearchController:
             self._record_search_event(payload, query, effective_query, context=context)
             return payload
 
-        if not self._reserve_backend_call():
+        if not self._reserve_backend_call(context):
             self.stats.blocked_calls += 1
             result = {
                 "query": effective_query,
@@ -229,7 +234,7 @@ class SearchController:
         # in a session (there is no prior query to compare against yet).
         if self.policy is None and not results and self.max_rewrites > 0 and not result.get("error"):
             rewritten = self._rewrite_for_novelty(query, context)
-            if rewritten and rewritten != effective_query and self._reserve_backend_call():
+            if rewritten and rewritten != effective_query and self._reserve_backend_call(context):
                 self.stats.rewritten_queries += 1
                 rewritten_args = dict(raw_args)
                 rewritten_args["query"] = rewritten
@@ -277,7 +282,7 @@ class SearchController:
             self._attach_policy_decision(result, decision)
             if decision.action == "rewrite_uncovered_facets" and self.max_rewrites > 0:
                 rewritten = self._rewrite_for_novelty(query, context)
-                if rewritten and rewritten != effective_query and self._reserve_backend_call():
+                if rewritten and rewritten != effective_query and self._reserve_backend_call(context):
                     self.stats.rewritten_queries += 1
                     rewritten_args = dict(raw_args)
                     rewritten_args["query"] = rewritten
@@ -305,7 +310,7 @@ class SearchController:
                         )
             elif decision.action == "switch_provider" and fallback_tools:
                 fallback_name, fallback_tool, fallback_args = list(fallback_tools)[0]
-                if not self._reserve_backend_call():
+                if not self._reserve_backend_call(context):
                     result["policy_fallback"] = {
                         "results": [],
                         "error_type": "budget",
@@ -342,7 +347,7 @@ class SearchController:
             and self._has_similar_query(effective_query)
         ):
             rewritten = self._rewrite_for_novelty(query, context)
-            if rewritten and rewritten != effective_query and self._reserve_backend_call():
+            if rewritten and rewritten != effective_query and self._reserve_backend_call(context):
                 self.stats.rewritten_queries += 1
                 rewritten_args = dict(raw_args)
                 rewritten_args["query"] = rewritten
@@ -411,6 +416,7 @@ class SearchController:
             "seen_content": len(self._seen_content),
             "policy": self.policy.metadata() if self.policy is not None else None,
             "policy_decisions": copy.deepcopy(self._policy_decisions),
+            "task_backend_calls": copy.deepcopy(self._task_backend_calls),
             "events": copy.deepcopy(self._search_events),
         }
 
@@ -422,6 +428,7 @@ class SearchController:
         self._seen_content.clear()
         self._policy_decisions.clear()
         self._search_events.clear()
+        self._task_backend_calls.clear()
         if self.policy is not None:
             self.policy.reset()
         self.stats = SearchControlStats()
@@ -457,7 +464,7 @@ class SearchController:
             "duplicate_ratio": round(duplicate_count / max(total_seen, 1), 4),
             "evidence_novelty": float(result.get("evidence_novelty", 0.0) or 0.0),
             "unresolved_claims": unresolved,
-            "search_attempts": self.stats.backend_calls,
+            "search_attempts": self._task_backend_calls.get(self._task_key(context), 0),
             "remaining_search_budget": remaining,
             "provider_health": str(context.get("provider_health") or ("unhealthy" if result.get("error") else "healthy")),
             "query_type": str(context.get("query_type", "unknown")),
@@ -509,22 +516,36 @@ class SearchController:
             "policy_rule_id": str(policy.get("rule_id", "")) if isinstance(policy, Mapping) else "",
             "stage": str((context or {}).get("stage", "worker")),
             "task_id": str((context or {}).get("task_id", "")),
+            "facet_id": str((context or {}).get("facet_id", "")),
+            "claim_ids": list((context or {}).get("claim_ids", []) or []),
+            "source_cluster_ids": list((context or {}).get("source_cluster_ids", []) or []),
+            "action": str((context or {}).get("action", "")),
+            "estimated_value": (context or {}).get("estimated_value"),
+            "task_search_attempts": self._task_backend_calls.get(self._task_key(context), 0),
+            "run_backend_calls": self.stats.backend_calls,
         }
         self._search_events.append(event)
 
-    def _reserve_backend_call(self) -> bool:
+    @staticmethod
+    def _task_key(context: Mapping[str, Any] | None) -> str:
+        task_id = str((context or {}).get("task_id", "")).strip()
+        return task_id or "__session__"
+
+    def _reserve_backend_call(self, context: Mapping[str, Any] | None = None) -> bool:
         """Reserve one provider call before the first await in a worker.
 
         All workers share one controller.  Since this method contains no await,
-        concurrent asyncio tasks cannot overbook the session budget between the
-        check and increment.
+        concurrent asyncio tasks cannot overbook either the run budget or a
+        task's policy budget between the check and increment.
         """
-        limit = self.max_backend_calls
-        if self.policy is not None:
-            limit = min(limit, max(int(self.policy.max_search_attempts), 1))
-        if self.stats.backend_calls >= limit:
+        if self.stats.backend_calls >= self.max_backend_calls:
+            return False
+        task_key = self._task_key(context)
+        task_calls = self._task_backend_calls.get(task_key, 0)
+        if self.policy is not None and task_calls >= max(int(self.policy.max_search_attempts), 1):
             return False
         self.stats.backend_calls += 1
+        self._task_backend_calls[task_key] = task_calls + 1
         return True
 
     def _tokens(self, text: str) -> set[str]:

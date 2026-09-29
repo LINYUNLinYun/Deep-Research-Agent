@@ -148,6 +148,13 @@ planner:
   evidence_gain_threshold: 0.15
   evidence_gain_patience: 1
   max_tool_calls_per_subagent: 6
+  research_state:
+    # Strategy 2 starts in shadow mode: it records facet coverage/frontier
+    # decisions without changing the proven DAG execution path.
+    enabled: false
+    active: false
+    marginal_gain_threshold: 0.15
+    max_consecutive_action: 2
 
 compressor:
   # M3: Context Compressor 配置
@@ -258,6 +265,12 @@ harness_evolution:
   registry_dir: "configs/harness_evolution/registries"
   registry: "production"
 
+summarizer:
+  # Model-facing projection of the lossless Evidence Ledger. Both bounds are
+  # required: source count alone did not prevent synthesis prompt truncation.
+  max_catalog_sources: 24
+  max_catalog_chars: 12000
+
 tools:
   # 工具模块全局配置
   search_control:
@@ -268,7 +281,7 @@ tools:
     novelty_threshold: 0.15
     max_rewrites: 1
     # Run-scoped provider hard cap; remains active when Harness Evolution is disabled.
-    max_backend_calls_per_run: 64
+    max_backend_calls_per_run: 128
   execution:
     retry_delay: 0.5
     max_retry_delay: 8.0

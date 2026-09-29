@@ -134,7 +134,7 @@ def test_runner_policy_loading_is_opt_in_and_defaults_to_production():
     assert len(policy.sha256) == 64
 
 
-def test_session_hard_cap_blocks_provider_before_next_call():
+def test_task_hard_cap_blocks_provider_before_next_call():
     spec = _spec()
     spec["hard_limits"]["max_search_attempts"] = 2
     controller = SearchController(policy=SearchControlPolicy(spec, sha256="cap"))
@@ -163,6 +163,40 @@ def test_session_hard_cap_blocks_provider_before_next_call():
         "new_results": 2,
         "blocked_calls": 1,
     }
+
+
+def test_task_hard_cap_does_not_starve_other_workers():
+    spec = _spec()
+    spec["hard_limits"]["max_search_attempts"] = 2
+    controller = SearchController(
+        max_backend_calls=10,
+        policy=SearchControlPolicy(spec, sha256="per-task-cap"),
+    )
+    tool = _Search([
+        [{"title": "A1", "url": "https://example.com/a1", "snippet": "a1"}],
+        [{"title": "A2", "url": "https://example.com/a2", "snippet": "a2"}],
+        [{"title": "B1", "url": "https://example.com/b1", "snippet": "b1"}],
+        [{"title": "B2", "url": "https://example.com/b2", "snippet": "b2"}],
+    ])
+
+    async def run():
+        queries = {
+            "task-a": ("alpha market", "beta revenue"),
+            "task-b": ("gamma policy", "delta adoption"),
+        }
+        for task_id, task_queries in queries.items():
+            for query in task_queries:
+                await controller.execute(
+                    tool,
+                    {"query": query},
+                    context={"task_id": task_id},
+                )
+
+    asyncio.run(run())
+    snapshot = controller.snapshot()
+    assert len(tool.calls) == 4
+    assert snapshot["stats"]["backend_calls"] == 4
+    assert snapshot["task_backend_calls"] == {"task-a": 2, "task-b": 2}
 
 
 def test_policy_mechanism_requires_candidate_behavior_change():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 
 from evaluation.benchmarks.hotpotqa import HotpotQABenchmark
@@ -124,6 +125,35 @@ def test_summarizer_builds_bounded_numbered_source_catalog() -> None:
     assert "using [N]" in prompt
     assert "refer-then-claim" in prompt
     assert catalog[0]["source_id"].startswith("src_")
+
+
+def test_summarizer_catalog_obeys_count_and_character_budgets() -> None:
+    results = []
+    for index in range(10):
+        results.append(AgentResult(
+            f"task_{index}", AgentStatus.SUCCESS, output="finding", confidence=0.8,
+            trajectory=[{"role": "tool", "result": {"results": [{
+                "title": f"Source {index}",
+                "url": f"https://example{index}.com/report",
+                "snippet": "evidence " * 200,
+            }]}}],
+        ))
+    summarizer = SummarizerAgent(
+        "s", policy=lambda _: {"content": ""},
+        max_catalog_sources=3, max_catalog_chars=1800,
+    )
+    catalog = summarizer.collect_sources("q", results)
+    prompt = summarizer._build_synthesis_prompt("q", results, catalog)
+    assert len(catalog) <= 3
+    assert all(len(source["source_span"]) <= 500 for source in catalog)
+    assert len(prompt.split("# Source Catalog", 1)[1]) < 3000
+
+
+def test_summarizer_marks_current_source_for_latest_query() -> None:
+    current_year = datetime.now().astimezone().year
+    assert SummarizerAgent._temporal_relevance(
+        "latest model progress", f"{current_year}-03-01"
+    ) == "current"
 
 
 def test_evidence_ledger_preserves_browser_source_and_full_span() -> None:
