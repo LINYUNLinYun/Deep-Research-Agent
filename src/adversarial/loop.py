@@ -1,7 +1,7 @@
 """
-M5 Red-Blue 对抗降噪循环 — 主控制器
+M5 Critic-Repairer 对抗降噪循环 — 主控制器
 
-AdversarialLoop 驱动 Red Agent → Blue Agent → 评分的完整对抗流程，
+AdversarialLoop 驱动 Critic Agent → Repairer Agent → 评分的完整对抗流程，
 具备死循环检测、震荡检测、收敛判断等鲁棒机制。
 
 设计决策：
@@ -15,15 +15,16 @@ import copy
 import inspect
 import logging
 import re
+import time
 from typing import Any
 
-from src.adversarial.blue_agent import BlueAgent
-from src.adversarial.red_agent import RedAgent
+from src.adversarial.repairer_agent import RepairerAgent
+from src.adversarial.critic_agent import CriticAgent
 from src.adversarial.verdict import (
     Dimension,
     FixOperation,
     Issue,
-    RedVerdict,
+    CriticVerdict,
     VerdictEngine,
 )
 from src.orchestrator.schemas import ResearchReport
@@ -36,11 +37,11 @@ logger = logging.getLogger(__name__)
 
 
 class AdversarialLoop:
-    """Red-Blue 对抗降噪循环主控制器。
+    """Critic-Repairer 对抗降噪循环主控制器。
 
     Attributes:
-        red_agent: Red Agent 实例，负责攻击。
-        blue_agent: Blue Agent 实例，负责修复。
+        critic_agent: Critic Agent 实例，负责攻击。
+        repairer_agent: Repairer Agent 实例，负责修复。
         policy: 用于 self_verify 或辅助评分的策略对象（可选）。
         max_rounds: 硬上限轮数。
         score_threshold: 综合分达标阈值。
@@ -49,8 +50,8 @@ class AdversarialLoop:
 
     def __init__(
         self,
-        red_agent: RedAgent,
-        blue_agent: BlueAgent,
+        critic_agent: CriticAgent,
+        repairer_agent: RepairerAgent,
         policy: Any | None = None,
         max_rounds: int = 3,
         score_threshold: float = 8.0,
@@ -58,14 +59,14 @@ class AdversarialLoop:
         rescore_after_fix: bool = True,
         evidence_verifier: Any | None = None,
     ):
-        self.red_agent = red_agent
-        self.blue_agent = blue_agent
+        self.critic_agent = critic_agent
+        self.repairer_agent = repairer_agent
         self.policy = policy
         self.max_rounds = max(max_rounds, 1)
         self.score_threshold = score_threshold
         self.delta_threshold = delta_threshold
         # A post-fix score is required for ``final_score`` to describe the
-        # returned report rather than the pre-fix Red verdict.  The flag keeps
+        # returned report rather than the pre-fix Critic verdict.  The flag keeps
         # the old call shape usable for constrained/offline deployments.
         self.rescore_after_fix = bool(rescore_after_fix)
         self.evidence_verifier = evidence_verifier
@@ -77,8 +78,8 @@ class AdversarialLoop:
         """运行完整的对抗降噪循环。
 
         流程：
-        1. 每轮用 Red Agent 攻击当前报告。
-        2. Blue Agent 根据 Verdict 修复。
+        1. 每轮用 Critic Agent 攻击当前报告。
+        2. Repairer Agent 根据 Verdict 修复。
         3. 记录本轮评分和修复操作。
         4. 检查收敛条件或震荡/死循环。
         5. 返回最终报告和完整历史。
@@ -96,6 +97,7 @@ class AdversarialLoop:
         best_score: float | None = None
         accepted_rounds = 0
         history: list[dict[str, Any]] = []
+        self.last_history = history
         prev_scores: dict[Dimension, float] | None = None
         # Store canonical fingerprints instead of full LLM wording.  Models
         # often paraphrase the same issue on the next round; exact dataclass
@@ -107,16 +109,22 @@ class AdversarialLoop:
         # Surface unavailable backends to the caller instead of converting an
         # authentication/network error into a neutral verdict or convergence.
         current.adversarial_status = "running"
+        started = time.monotonic()
+        self.best_report = copy.deepcopy(best_report)
+        time_budget = getattr(self, "time_budget_seconds", None)
 
         for round_idx in range(1, self.max_rounds + 1):
+            round_started = time.monotonic()
             logger.info(f"[AdversarialLoop] Round {round_idx} starting...")
 
-            # ---- Step 1: Red Attack ----
-            verdict = await self.red_agent.attack(current)
+            pre_confidence = current.confidence
+            pre_evidence = dict(current.evidence_verification)
+            # ---- Step 1: Critic Attack ----
+            verdict = await self.critic_agent.attack(current)
             if verdict.status != "success":
-                reason = verdict.error or "Red Agent backend unavailable"
+                reason = verdict.error or "Critic Agent backend unavailable"
                 logger.error(f"[Adversarial] SKIPPED: {reason}")
-                stop_reason = f"red_failed_at_round_{round_idx}"
+                stop_reason = f"critic_failed_at_round_{round_idx}"
                 history.append(self._build_round_record(
                     round_idx, verdict, [], len(resolved_issues), False,
                     stop_reason, accepted=False, outcome="failed",
@@ -130,7 +138,7 @@ class AdversarialLoop:
                 best_score = verdict.overall_score
                 best_report = copy.deepcopy(current)
             logger.info(
-                f"[AdversarialLoop] Red attack done: overall={verdict.overall_score:.2f}, "
+                f"[AdversarialLoop] Critic attack done: overall={verdict.overall_score:.2f}, "
                 f"issues={len(verdict.issues)}"
             )
 
@@ -150,15 +158,15 @@ class AdversarialLoop:
                 ))
                 break
 
-            # ---- Step 3: Blue Defend ----
-            fixed_report, operations = await self.blue_agent.defend(current, verdict)
+            # ---- Step 3: Repairer Defend ----
+            fixed_report, operations = await self.repairer_agent.defend(current, verdict)
             logger.info(
-                f"[AdversarialLoop] Blue defend done: operations={len(operations)}"
+                f"[AdversarialLoop] Repairer defend done: operations={len(operations)}"
             )
-            blue_status = getattr(self.blue_agent, "status", "success")
-            if blue_status == "failed" and fixed_report.content == current.content:
-                reason = getattr(self.blue_agent, "error", "Blue Agent backend unavailable")
-                stop_reason = f"blue_failed_at_round_{round_idx}"
+            repairer_status = getattr(self.repairer_agent, "status", "success")
+            if repairer_status == "failed" and fixed_report.content == current.content:
+                reason = getattr(self.repairer_agent, "error", "Repairer Agent backend unavailable")
+                stop_reason = f"repairer_failed_at_round_{round_idx}"
                 history.append(self._build_round_record(
                     round_idx, verdict, operations, len(resolved_issues), False,
                     stop_reason, accepted=False, outcome="failed",
@@ -171,15 +179,15 @@ class AdversarialLoop:
                 ), history
 
             # Re-score the post-fix content.  Without this pass a report could
-            # be materially changed by Blue while final_score still reflected
-            # Red's score for the old text.  A backend failure is surfaced as a
+            # be materially changed by Repairer while final_score still reflected
+            # Critic's score for the old text.  A backend failure is surfaced as a
             # skipped adversarial run instead of being converted into a score.
             scored_verdict = verdict
             if self.rescore_after_fix and fixed_report.content != current.content:
-                scored_verdict = await self.red_agent.attack(fixed_report)
+                scored_verdict = await self.critic_agent.attack(fixed_report)
                 if scored_verdict.status != "success":
-                    reason = scored_verdict.error or "post-fix Red Agent backend unavailable"
-                    stop_reason = f"post_fix_red_failed_at_round_{round_idx}"
+                    reason = scored_verdict.error or "post-fix Critic Agent backend unavailable"
+                    stop_reason = f"post_fix_critic_failed_at_round_{round_idx}"
                     history.append(self._build_round_record(
                         round_idx, verdict, operations, len(resolved_issues), False,
                         stop_reason, accepted=False,
@@ -191,17 +199,23 @@ class AdversarialLoop:
                         initial_status="failed",
                     ), history
 
+            post_evidence = await self._verify_evidence(fixed_report) if fixed_report.content != current.content else pre_evidence
+
             # Never commit a round that regresses its own independent post-fix
-            # Red score.  This applies to both complete and partial defenses.
+            # Critic score.  This applies to both complete and partial defenses.
             acceptance_floor = max(
                 verdict.overall_score,
                 best_score if best_score is not None else verdict.overall_score,
             )
-            if (
-                fixed_report.content != current.content
-                and scored_verdict.overall_score + 1e-9 < acceptance_floor
+            evidence_regressed = bool(
+                pre_evidence.get("total_claims") and post_evidence.get("total_claims")
+                and (post_evidence.get("support_rate", 0) + 1e-9 < pre_evidence.get("support_rate", 0)
+                     or post_evidence.get("contradicted", 0) > pre_evidence.get("contradicted", 0))
+            )
+            if fixed_report.content != current.content and (
+                scored_verdict.overall_score + 1e-9 < acceptance_floor or evidence_regressed
             ):
-                stop_reason = (
+                stop_reason = "post_fix_evidence_regressed" if evidence_regressed else (
                     "post_fix_score_regressed"
                     f"({scored_verdict.overall_score:.3f}<{acceptance_floor:.3f})"
                 )
@@ -210,6 +224,8 @@ class AdversarialLoop:
                     stop_reason, pre_verdict=verdict, accepted=False,
                     outcome="discarded",
                 ))
+                history[-1].update(pre_confidence=pre_confidence, post_confidence=fixed_report.confidence,
+                                   pre_evidence_summary=pre_evidence, evidence_summary=post_evidence)
                 history[-1]["fallback_to_best"] = accepted_rounds > 0
                 return self._failure_fallback(
                     best_report, best_score, accepted_rounds, round_idx, stop_reason,
@@ -229,8 +245,8 @@ class AdversarialLoop:
 
             # ---- Step 5: 记录本轮 ----
             stop_reason = self._check_convergence(round_idx, scored_verdict.overall_score, delta)
-            if blue_status == "partial":
-                stop_reason = f"blue_partial_at_round_{round_idx}"
+            if repairer_status == "partial":
+                stop_reason = f"repairer_partial_at_round_{round_idx}"
             record = self._build_round_record(
                 round_idx=round_idx,
                 verdict=scored_verdict,
@@ -239,7 +255,7 @@ class AdversarialLoop:
                 oscillation=oscillation_detected,
                 stop_reason=stop_reason,
                 pre_verdict=verdict if scored_verdict is not verdict else None,
-                outcome="partial" if blue_status == "partial" else "success",
+                outcome="partial" if repairer_status == "partial" else "success",
             )
             history.append(record)
 
@@ -247,54 +263,29 @@ class AdversarialLoop:
             changed = fixed_report.content != current.content
             current = fixed_report
             current.adversarial_rounds = round_idx
-            if blue_status == "partial":
+            current.final_score = scored_verdict.overall_score
+            if repairer_status == "partial":
                 current.adversarial_status = "partial"
-                current.adversarial_reason = getattr(self.blue_agent, "error", "")
+                current.adversarial_reason = getattr(self.repairer_agent, "error", "")
 
-            evidence_summary: dict[str, Any] | None = None
-            if self.evidence_verifier is not None:
-                try:
-                    verify_fn = getattr(self.evidence_verifier, "verify", None)
-                    if verify_fn is None:
-                        verify_fn = getattr(self.evidence_verifier, "verify_sync")
-                    verification = verify_fn(current)
-                    if inspect.isawaitable(verification):
-                        verification = await verification
-                    serialized_verification = [
-                        item.to_dict() if hasattr(item, "to_dict") else item
-                        for item in (verification or [])
-                    ]
-                    summarize = getattr(self.evidence_verifier, "summary", None)
-                    if callable(summarize):
-                        evidence_summary = summarize(verification or [])
-                    current.claim_evidence_edges = [
-                        {
-                            "claim_id": item.get("claim", {}).get("claim_id", ""),
-                            "source_id": evidence.get("metadata", {}).get("source_id", ""),
-                            "relation": item.get("status", "unknown"),
-                            "confidence": item.get("confidence", 0.0),
-                            "reason": item.get("reason", ""),
-                        }
-                        for item in serialized_verification
-                        if isinstance(item, dict)
-                        for evidence in item.get("evidence", [])
-                        if isinstance(evidence, dict)
-                    ]
-                    current.evidence_verification = evidence_summary or {
-                        "results": serialized_verification
-                    }
-                except Exception as exc:  # evidence is a quality signal, not a hard failure
-                    logger.warning("[AdversarialLoop] evidence verification failed: %s", exc)
-                    current.evidence_verification = {"error": str(exc)}
-                    evidence_summary = {"error": str(exc)}
-            if evidence_summary is not None:
-                record["evidence_summary"] = evidence_summary
+            record["pre_confidence"] = pre_confidence
+            record["post_confidence"] = current.confidence
+            record["pre_evidence_summary"] = pre_evidence
+            record["evidence_summary"] = post_evidence
+            logger.info("[AdversarialLoop] Accepted evidence confidence: %.2f -> %.2f", pre_confidence, current.confidence)
 
             if changed:
                 accepted_rounds += 1
                 best_score = scored_verdict.overall_score
                 best_report = copy.deepcopy(current)
+                self.best_report = copy.deepcopy(best_report)
             record["accepted_rounds"] = accepted_rounds
+            if time_budget is not None and (
+                time_budget - (time.monotonic() - started)
+                < (time.monotonic() - round_started) * 1.15
+            ):
+                stop_reason = stop_reason or "remaining_time_insufficient_for_next_round"
+                record["stop_reason"] = stop_reason
 
             # ---- Step 6: 判断是否停止 ----
             if stop_reason:
@@ -311,6 +302,34 @@ class AdversarialLoop:
             current.adversarial_status = "success"
 
         return current, history
+
+    async def _verify_evidence(self, report: ResearchReport) -> dict[str, Any]:
+        report.source_catalog = list(report.sources)
+        report.evidence = list(report.sources)
+        if self.evidence_verifier is None:
+            return dict(report.evidence_verification)
+        verify = getattr(self.evidence_verifier, "verify", None) or self.evidence_verifier.verify_sync
+        results = verify(report)
+        if inspect.isawaitable(results):
+            results = await results
+        summary = self.evidence_verifier.summary(results or [])
+        summary["unresolved_claims"] = [
+            {"claim_id": item.claim.claim_id, "text": item.claim.text,
+             "status": item.status.value, "reason": item.reason,
+             "candidate_sources": [{"url": e.source_url, "span": e.source_span[:500]}
+                                   for e in item.evidence[:3]]}
+            for item in results if item.status.value != "supported"
+        ]
+        report.evidence_verification = summary
+        report.open_questions = [item.to_dict() for item in results if item.status.value != "supported"]
+        report.claim_evidence_edges = [
+            {"claim_id": item.claim.claim_id, "source_id": evidence.metadata.get("source_id", ""),
+             "relation": item.status.value, "confidence": item.confidence, "reason": item.reason}
+            for item in results for evidence in item.evidence
+        ]
+        from ..evidence.confidence import calibrate
+        calibrate(report, summary)
+        return summary
 
     @staticmethod
     def _failure_fallback(
@@ -369,12 +388,12 @@ class AdversarialLoop:
     def _build_round_record(
         self,
         round_idx: int,
-        verdict: RedVerdict,
+        verdict: CriticVerdict,
         operations: list[FixOperation],
         resolved_count: int,
         oscillation: bool,
         stop_reason: str,
-        pre_verdict: RedVerdict | None = None,
+        pre_verdict: CriticVerdict | None = None,
         accepted: bool = True,
         outcome: str = "success",
     ) -> dict[str, Any]:
@@ -387,7 +406,7 @@ class AdversarialLoop:
             "overall_score": round(verdict.overall_score, 3),
             "issues_count": len(verdict.issues),
             "issue_stats": dict(getattr(verdict, "issue_stats", {}) or {}),
-            "red_retry_stats": dict(getattr(verdict, "retry_stats", {}) or {}),
+            "critic_retry_stats": dict(getattr(verdict, "retry_stats", {}) or {}),
             "fix_operations": [op.to_dict() for op in operations],
             "resolved_count": resolved_count,
             "oscillation_detected": oscillation,
@@ -397,8 +416,8 @@ class AdversarialLoop:
             "raw_feedback": verdict.raw_feedback,
         }
         if operations:
-            record["blue_repair_stats"] = dict(
-                getattr(self.blue_agent, "last_repair_stats", {}) or {}
+            record["repairer_repair_stats"] = dict(
+                getattr(self.repairer_agent, "last_repair_stats", {}) or {}
             )
         if pre_verdict is not None:
             record["pre_fix_score"] = round(pre_verdict.overall_score, 3)
@@ -406,4 +425,9 @@ class AdversarialLoop:
             record["pre_fix_dimension_scores"] = {
                 k.value: round(v, 3) for k, v in pre_verdict.dimension_scores.items()
             }
+        logger.info("[AdversarialLoop] Round audit: %s", {
+            "round": round_idx, "accepted": accepted, "stop_reason": stop_reason,
+            "before": record.get("pre_fix_dimension_scores", record["dimension_scores"]),
+            "after": record["dimension_scores"],
+        })
         return record

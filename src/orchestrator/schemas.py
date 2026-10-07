@@ -32,6 +32,30 @@ class OrchestratorState(Enum):
     """M1 编排层 9 状态状态机。
 
     正常流: IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → ADVERSARIAL → DONE
+        - IDLE 空闲状态
+        - PLANNING planer 负责生成计划并进行任务拆分，第一层，正则解析会粗略处理llm返回的result，确保能提取出json。
+            即使json能提取出DAG，也不一定合法，所以第二层会检测有向无环图本身是否正常（如是否有环、各个对象的属性是否缺失or不合法）。
+            如果确实不行，用一个提示词让llm重新生成。充实三次都不行直接OrchestratorState.FAILED
+
+            如果是replan三次失败，那就拿已有的success task直接拼起来得到一份报告
+            replan 分为三种。一种是针对planner重新生成DAG的，触发条件有两种：
+            - 一、如果某一层执行失败的tasks占比超过了阈值。这个阈值默认为0.35。那么就重新规划这个dag；
+            - 二、或者如果有关键的前置节点，它的依赖没有满足。那么也是重新生成DAG
+            - 三、成功任务中，没有置信度 **≥ 0.45** 的可用结果， 置信度由llm给出
+            第二种replan是针对evidence gap进行verify的（一个小型验证 DAG，默认每轮最多 3 个 VERIFY 任务）：
+            - 比方说文献中的某些论断，没有引用的支持，或者和引用的表述语义上不一致。就为这些论断单独生成verifyer的DAG，然后执行这个DAG
+        - DISPATCHING：Dispatcher 对 DAG 做拓扑分层，再由 AgentPool 为各节点分配 ResearcherAgent 去执行。pool中默认零个实例，实例有search、analyze、verify三种。
+            其中前两种并无特殊，就是继承自ResearcherAgent而已，系统提示词一样，加了点任务提示词，如根据query完成指定任务的搜索，如根据综合的结果完成分析
+            特别点的是verify，它要求必须输出 JSON，判断支持、矛盾或未知，并提供证据。
+            pool中的实例默认为0，若有需要，根据任务的并发数量创建对应的实例，但是每个类型的idle的实例最多就3个。
+        - COLLECTING 汇总DISPATCHING的结果，检查任务成功/失败，证据缺口等。判断是否需要replan（两种），值得一提的是这里是要还有token预算才进入replan的
+            研究累计预算默认是 100,000 tokens；16,000 / 预留 2,048 是压缩器的单次上下文预算。
+        - SYNTHESIZING 把各个子任务的结果整合成完整研究报告的阶段，由 `SummarizerAgent` 执行。所以ResearcherAgent主要做搜索、分析、验证。这个负责总结汇总。
+            拿到先前任务执行的结果，整理引用来源生成报告，以及置信度，并根据文中的无支持论断的数量调整置信度。
+            若无支持论断比例≥0.6，就调用repaln生成一个小型验证 DAG，默认每轮最多 3 个 VERIFY 任务，回到上面那那个replan的逻辑
+        - ADVERSARIAL： ，由 `CriticAgent`、`RepairerAgent` 和 `AdversarialLoop` 配合完成，报告置信度达到默认阈值 0.8，会跳过对抗审查。
+            这里的Critic，审查员要用mimo——因为都用deepseek，同样模型有同样的输出分布，它可能在审查时也认可自己写作时的假设，漏掉同一类问题，一些错误无法靠自己纠正。
+        - REPLANNING：保留可用的task（sha检测），避免成功task重做浪费api，把原问题、失败任务、已有结果和失败原因交给它，生成新的任务 DAG。
     异常流:
       - 局部失败 → REPLANNING (增量重规划) → DISPATCHING
       - 全局失败 / 超过最大重规划次数 → FAILED
@@ -152,6 +176,8 @@ class ResearchReport:
     open_questions: list[dict[str, Any]] = field(default_factory=list)
     evidence_verification: dict[str, Any] = field(default_factory=dict)
     research_state: dict[str, Any] = field(default_factory=dict)
+    confidence_basis: float | None = None
+    adversarial_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

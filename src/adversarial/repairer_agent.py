@@ -1,7 +1,7 @@
 """
-M5 Blue Agent — 修复与防御器
+M5 Repairer Agent — 修复与防御器
 
-Blue Agent 接收 Red Agent 的 Verdict，按优先级排序并执行三类修复：
+Repairer Agent 接收 Critic Agent 的 Verdict，按优先级排序并执行三类修复：
 1. In-place Fix：数字/日期与 source 不一致 → 直接替换
 2. Supplementary Search：unsourced claims → 触发新搜索
 3. Removal：高置信幻觉 → 删除段落
@@ -14,6 +14,7 @@ import asyncio
 import copy
 import difflib
 import inspect
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -23,21 +24,23 @@ from src.adversarial.verdict import (
     FixOperation,
     FixType,
     Issue,
-    RedVerdict,
+    CriticVerdict,
     Severity,
     VerdictEngine,
 )
 from src.orchestrator.schemas import ResearchReport
 from src.utils.tracing import trace_agent
 from src.utils.runtime_context import runtime_context_text
+from src.utils.temporal import infer_source_date, temporal_relevance
+from src.tools.search_controller import SearchController
 
 
-__all__ = ["BlueAgent", "IssueContext"]
+__all__ = ["RepairerAgent", "IssueContext"]
 
 
 @dataclass(frozen=True)
 class IssueContext:
-    """A bounded report view centered on one Red issue."""
+    """A bounded report view centered on one Critic issue."""
 
     excerpt: str
     target_text: str
@@ -52,8 +55,8 @@ class IssueContext:
 # Prompt 模板
 # ============================================================================
 
-SYSTEM_BLUE_AGENT = (
-    runtime_context_text() + "\n\n你是一位严谨的研究报告修订员（Blue Agent）。你的任务是根据审查意见修复研究报告，"
+SYSTEM_REPAIRER_AGENT = (
+    runtime_context_text() + "\n\n你是一位严谨的研究报告修订员（Repairer Agent）。你的任务是根据审查意见修复研究报告，"
     "确保所有修改都有据可依，不引入新错误。输出必须是 JSON 格式。"
 )
 
@@ -90,6 +93,8 @@ PROMPT_IN_PLACE_FIX = """请根据以下审查意见，对研究报告进行【�
 3. 所有修改必须基于提供的 sources，不能引入新信息。
 4. fixed_content 必须为空，只通过 changes 返回精确补丁，禁止重写整篇报告。
 5. 只能修改 <TARGET>...</TARGET> 内的内容；报告开头和结尾仅用于理解上下文。
+6. 不得把来源中的原始事件日期改成查询时间窗以使其看似相关。区间外证据只能明确标注为历史背景或删除；缺乏当期数据时保留证据缺口，不能编造日期、数字或会议安排。
+7. 无来源支持的数字、点位和排名应删除或替换为“数据不可得”，不要保留原数字再附加免责声明。删除整句时 after 可为空字符串。
 
 请按以下 JSON 格式输出：
 {
@@ -124,6 +129,7 @@ PROMPT_SUPPLEMENTARY_SEARCH = """请根据以下审查意见，对研究报告�
 6. 搜索结果只能用 {{SOURCE_1}} 这类占位符引用；禁止自行编造 [21] 等数字引用。程序会把占位符映射为正式引用。
 7. 若搜索摘要不足以支持 claim，应删除、弱化或标注未经证实，不得强行引用。
 8. 只能修改 <TARGET>...</TARGET> 内的内容。
+9. 搜索仍无法证实具体数字、点位或排名时，删除该数字或表格行，以“数据不可得”概括缺口；不要保留原数字再附加免责声明，也不要加入与待验证事实无关的行情作为反证。删除整句时 after 可为空字符串。
 
 请按以下 JSON 格式输出：
 {
@@ -180,11 +186,11 @@ PROMPT_REMOVAL = """请根据以下审查意见，对研究报告进行【移除
 
 
 # ============================================================================
-# Blue Agent 实现
+# Repairer Agent 实现
 # ============================================================================
 
-class BlueAgent:
-    """Blue Agent — 修复与防御器。
+class RepairerAgent:
+    """Repairer Agent — 修复与防御器。
 
     Attributes:
         policy: VLLMPolicy 实例。
@@ -233,11 +239,11 @@ class BlueAgent:
                 return t
         return None
 
-    @trace_agent(name="blue_agent.defend", tags=["m5", "blue", "adversarial"])
+    @trace_agent(name="repairer_agent.defend", tags=["m5", "repairer", "adversarial"])
     async def defend(
-        self, report: ResearchReport, verdict: RedVerdict
+        self, report: ResearchReport, verdict: CriticVerdict
     ) -> tuple[ResearchReport, list[FixOperation]]:
-        """根据 Red Verdict 修复研究报告。
+        """根据 Critic Verdict 修复研究报告。
 
         执行流程：
         1. 按优先级对 issues 排序。
@@ -247,7 +253,7 @@ class BlueAgent:
 
         Args:
             report: 原始研究报告（不会被修改，内部深拷贝）。
-            verdict: Red Agent 的审查结果。
+            verdict: Critic Agent 的审查结果。
 
         Returns:
             (fixed_report, fix_operations)
@@ -267,7 +273,7 @@ class BlueAgent:
         if not verdict.issues:
             return current, operations
 
-        # Red 正常会先截断；这里再次去重和封顶，避免外部构造的 Verdict
+        # Critic 正常会先截断；这里再次去重和封顶，避免外部构造的 Verdict
         # 绕过预算边界。
         sorted_issues = self._select_issues(verdict.issues)
         committed = 0
@@ -305,14 +311,14 @@ class BlueAgent:
             # self_verify 后才提交；失败只回滚当前修复，不丢弃此前提交。
             try:
                 verify_pass, verify_issues = await self._self_verify(
-                    before.content, current.content, operations
+                    before.content, current.content, [op]
                 )
             except Exception as exc:
                 verify_pass = False
                 verify_issues = [Issue(
                     severity=Severity.MAJOR,
                     dimension=Dimension.LOGICAL,
-                    description=f"Blue Agent self-verification failed: {exc}",
+                    description=f"Repairer Agent self-verification failed: {exc}",
                     fix_type=FixType.IN_PLACE,
                 )]
                 self.error = str(exc)
@@ -376,7 +382,7 @@ class BlueAgent:
     @staticmethod
     def _require_response(resp):
         if getattr(resp, "get", None) and resp.get("status") == "failed":
-            raise RuntimeError(resp.get("error", "Blue Agent backend unavailable"))
+            raise RuntimeError(resp.get("error", "Repairer Agent backend unavailable"))
         return resp
 
     async def _call_policy(self, messages: list[dict[str, str]]) -> Any:
@@ -435,7 +441,7 @@ class BlueAgent:
             )
         )
         messages = [
-            {"role": "system", "content": SYSTEM_BLUE_AGENT},
+            {"role": "system", "content": SYSTEM_REPAIRER_AGENT},
             {"role": "user", "content": prompt},
         ]
         resp = self._require_response(await self._call_policy(messages))
@@ -496,7 +502,7 @@ class BlueAgent:
                         self._search_tool,
                         {"query": query},
                         execution_policy=self.search_execution_policy,
-                        context={"stage": "blue", "task_id": "adversarial_supplementary_search"},
+                        context={"stage": "repairer", "task_id": "adversarial_supplementary_search"},
                     )
                 elif hasattr(self._search_tool, "execute"):
                     if hasattr(self._search_tool.execute, "__call__"):
@@ -533,7 +539,7 @@ class BlueAgent:
         prompt = prompt.replace("{content}", context.excerpt)
         prompt = prompt.replace("{search_results}", search_results)
         messages = [
-            {"role": "system", "content": SYSTEM_BLUE_AGENT},
+            {"role": "system", "content": SYSTEM_REPAIRER_AGENT},
             {"role": "user", "content": prompt},
         ]
         resp = self._require_response(await self._call_policy(messages))
@@ -601,7 +607,7 @@ class BlueAgent:
         prompt = prompt.replace("{issue_desc}", issue.description)
         prompt = prompt.replace("{content}", context.excerpt)
         messages = [
-            {"role": "system", "content": SYSTEM_BLUE_AGENT},
+            {"role": "system", "content": SYSTEM_REPAIRER_AGENT},
             {"role": "user", "content": prompt},
         ]
         resp = self._require_response(await self._call_policy(messages))
@@ -665,7 +671,7 @@ class BlueAgent:
         prompt = prompt.replace("{revised}", after_context)
         prompt = prompt.replace("{fixes}", fixes_text)
         messages = [
-            {"role": "system", "content": SYSTEM_BLUE_AGENT},
+            {"role": "system", "content": SYSTEM_REPAIRER_AGENT},
             {"role": "user", "content": prompt},
         ]
         resp = self._require_response(await self._call_policy(messages))
@@ -701,7 +707,7 @@ class BlueAgent:
             return False, [Issue(
                 severity=Severity.MAJOR,
                 dimension=Dimension.LOGICAL,
-                description=f"Blue Agent self-verification failed: {exc}",
+                description=f"Repairer Agent self-verification failed: {exc}",
                 fix_type=FixType.IN_PLACE,
             )]
 
@@ -775,9 +781,11 @@ class BlueAgent:
         added exclusively through SOURCE_n placeholders.
         """
         existing_ids = {int(value) for value in re.findall(r"\[(\d+)\]", report.content)}
-        next_id = max(existing_ids | {len(report.sources)}, default=0) + 1
+        catalog_ids = {int(s.get("citation_id", i)) for i, s in enumerate(report.sources, 1)}
+        existing_ids |= catalog_ids
+        next_id = max(existing_ids, default=0) + 1
         existing_urls = {
-            str(source.get("url", "") or ""): index
+            str(source.get("url", "") or ""): int(source.get("citation_id", index))
             for index, source in enumerate(report.sources, 1)
             if isinstance(source, dict) and source.get("url")
         }
@@ -792,7 +800,7 @@ class BlueAgent:
             change = dict(raw_change)
             before = str(change.get("before", "") or "")
             after = str(change.get("after", "") or "")
-            if not before or not after:
+            if not before or "after" not in change:
                 continue
 
             direct_ids = {int(value) for value in re.findall(r"\[(\d+)\]", after)}
@@ -824,7 +832,12 @@ class BlueAgent:
                         citation_id = next_id
                         next_id += 1
                         placeholder_ids[candidate_index] = citation_id
-                        additions.append(dict(source))
+                        canonical = SearchController.canonical_url(url)
+                        source_date = infer_source_date(source)
+                        additions.append({**source, "citation_id": citation_id,
+                            "source_id": "src_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16],
+                            "source_span": source["snippet"], "source_date": source_date,
+                            "temporal_relevance": temporal_relevance(report.query, source_date)})
                         title = (
                             source["title"].replace("\n", " ")
                             .replace("[", "").replace("]", "").strip()
@@ -1073,8 +1086,8 @@ class BlueAgent:
             s = sources[i - 1]
             title = s.get("title", "未知标题")
             url = s.get("url", "")
-            snippet = s.get("snippet", "")[:300]
-            lines.append(f"[{i}] {title}\nURL: {url}\nSnippet: {snippet}\n")
+            snippet = str(s.get("source_span") or s.get("snippet", ""))[:900]
+            lines.append(f"[{s.get('citation_id', i)}] {title}\nURL: {url}\nSource date: {s.get('source_date') or 'unknown'}; temporal relevance: {s.get('temporal_relevance', 'unknown')}\nEvidence span: {snippet}\n")
         if len(sources) > max_items:
             lines.append(f"... 还有 {len(sources) - max_items} 个来源未显示")
         return "\n".join(lines)
@@ -1111,7 +1124,7 @@ class BlueAgent:
     ) -> str:
         """Apply an LLM repair while preserving text outside its excerpt.
 
-        Blue's repair prompts ask for full content, but long reports are sent
+        Repairer's repair prompts ask for full content, but long reports are sent
         as bounded excerpts.  If a model returns a shortened report, replacing
         the original would lose everything after the excerpt.  Explicit patch
         records are applied to the original first; a candidate is accepted as
@@ -1146,7 +1159,7 @@ class BlueAgent:
                 and before in allowed_original
                 and original.count(before) == 1
                 and before in patched
-                and after
+                and "after" in item
             ):
                 patched = patched.replace(before, after, 1)
                 patch_count += 1
@@ -1171,7 +1184,7 @@ class BlueAgent:
             return candidate.replace("[报告中间内容省略；请仅返回明确修改，勿删除未显示内容]", "").strip()
         # Without anchors or an explicit patch, fail closed.  A near-complete
         # candidate can still silently omit the final paragraph, which is much
-        # worse than asking the next Red/Blue round to retry the repair.
+        # worse than asking the next Critic/Repairer round to retry the repair.
         return original
 
     def _parse_fix_json(self, raw: str) -> tuple[str, list[dict]]:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paired Red-Blue ablation over previously generated ResearchBench reports."""
+"""Paired Critic-Repairer ablation over previously generated ResearchBench reports."""
 
 from __future__ import annotations
 
@@ -22,9 +22,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from evaluation.benchmarks.research_bench import ResearchBench
-from src.adversarial.blue_agent import BlueAgent
+from src.adversarial.repairer_agent import RepairerAgent
 from src.adversarial.loop import AdversarialLoop
-from src.adversarial.red_agent import RedAgent
+from src.adversarial.critic_agent import CriticAgent
 from src.core.runner import _create_tools_factory, load_config
 from src.models.model_router import ModelRouter
 from src.orchestrator.schemas import ResearchReport
@@ -147,7 +147,7 @@ def summarize(details: list[dict[str, Any]]) -> dict[str, Any]:
     for item in completed:
         try:
             baseline = Path(item["baseline_path"]).read_text(encoding="utf-8")
-            candidate = Path(item["redblue_report_path"]).read_text(encoding="utf-8")
+            candidate = Path(item["critic_repairer_report_path"]).read_text(encoding="utf-8")
             modified_reports += baseline != candidate
         except (KeyError, OSError):
             continue
@@ -160,8 +160,8 @@ def summarize(details: list[dict[str, Any]]) -> dict[str, Any]:
             / max(len(completed), 1),
             6,
         ),
-        "redblue_average": round(
-            sum(item["redblue_evaluation"]["composite_score"] for item in completed)
+        "critic_repairer_average": round(
+            sum(item["critic_repairer_evaluation"]["composite_score"] for item in completed)
             / max(len(completed), 1),
             6,
         ),
@@ -171,8 +171,8 @@ def summarize(details: list[dict[str, Any]]) -> dict[str, Any]:
         "losses": sum(delta < -tolerance for delta in deltas),
         "modified_reports": modified_reports,
         "adversarial_statuses": adversarial_statuses,
-        "red_calls": sum(int(item.get("red_calls", 0)) for item in details),
-        "blue_calls": sum(int(item.get("blue_calls", 0)) for item in details),
+        "critic_calls": sum(int(item.get("critic_calls", 0)) for item in details),
+        "repairer_calls": sum(int(item.get("repairer_calls", 0)) for item in details),
         "elapsed_seconds": round(sum(float(item.get("elapsed_seconds", 0.0)) for item in details), 3),
     }
 
@@ -194,7 +194,7 @@ async def run_question(
     model_cfg = config["model"]
     sampling = model_cfg["backend_sampling"]
     adversarial_cfg = config["adversarial"]
-    backend = model_cfg["backend_mapping"]["red_agent"]
+    backend = model_cfg["backend_mapping"]["critic_agent"]
 
     def policy(module: str) -> CountingPolicy:
         kwargs = dict(sampling.get(backend, {}))
@@ -206,33 +206,33 @@ async def run_question(
             **kwargs,
         ))
 
-    red_policy = policy("red_agent")
-    blue_policy = policy("blue_agent")
+    critic_policy = policy("critic_agent")
+    repairer_policy = policy("repairer_agent")
     tools = _create_tools_factory(copy.deepcopy(config))
     max_issues = int(adversarial_cfg.get("max_issues_per_round", 5))
-    red = RedAgent(
-        red_policy,
-        max_tokens=int(adversarial_cfg.get("red_max_tokens", 4096)),
+    critic = CriticAgent(
+        critic_policy,
+        max_tokens=int(adversarial_cfg.get("critic_max_tokens", 4096)),
         max_issues=max_issues,
         max_issues_per_dimension=int(adversarial_cfg.get("max_issues_per_dimension", 2)),
         max_sources=int(adversarial_cfg.get("max_sources", 20)),
-        context_chars=int(adversarial_cfg.get("red_context_chars", 8000)),
-        dimension_parse_retries=int(adversarial_cfg.get("red_dimension_parse_retries", 1)),
+        context_chars=int(adversarial_cfg.get("critic_context_chars", 8000)),
+        dimension_parse_retries=int(adversarial_cfg.get("critic_dimension_parse_retries", 1)),
     )
-    blue = BlueAgent(
-        blue_policy,
+    repairer = RepairerAgent(
+        repairer_policy,
         tools=tools,
-        max_tokens=int(adversarial_cfg.get("blue_max_tokens", 4096)),
+        max_tokens=int(adversarial_cfg.get("repairer_max_tokens", 4096)),
         max_issues=max_issues,
         max_sources=int(adversarial_cfg.get("max_sources", 20)),
         max_consecutive_failures=int(adversarial_cfg.get("max_consecutive_failures", 2)),
         max_candidate_sources=int(adversarial_cfg.get("max_candidate_sources", 3)),
-        repair_context_chars=int(adversarial_cfg.get("blue_context_chars", 4000)),
+        repair_context_chars=int(adversarial_cfg.get("repairer_context_chars", 4000)),
         self_verify_context_chars=int(adversarial_cfg.get("self_verify_context_chars", 6000)),
     )
     loop = AdversarialLoop(
-        red,
-        blue,
+        critic,
+        repairer,
         max_rounds=int(adversarial_cfg.get("max_rounds", 3)),
         score_threshold=float(adversarial_cfg.get("score_threshold", 8.0)),
         delta_threshold=float(adversarial_cfg.get("delta_threshold", 0.3)),
@@ -264,25 +264,25 @@ async def run_question(
     candidate_path.write_text(result.content, encoding="utf-8")
     history_path = output_dir / "history" / f"{question_id}.json"
     atomic_json(history_path, {"question_id": question_id, "history": history})
-    redblue_evaluation = bench.evaluate_report(result.content, question_id)
+    critic_repairer_evaluation = bench.evaluate_report(result.content, question_id)
     return {
         "question_id": question_id,
         "domain": question.get("domain", ""),
         "status": run_status,
         "error": error,
         "baseline_path": str(baseline_path),
-        "redblue_report_path": str(candidate_path.resolve()),
+        "critic_repairer_report_path": str(candidate_path.resolve()),
         "history_path": str(history_path.resolve()),
         "sources_count": len(sources),
         "elapsed_seconds": round(elapsed, 3),
-        "red_calls": red_policy.calls,
-        "blue_calls": blue_policy.calls,
+        "critic_calls": critic_policy.calls,
+        "repairer_calls": repairer_policy.calls,
         "adversarial_status": result.adversarial_status,
         "adversarial_reason": result.adversarial_reason,
         "adversarial_rounds": result.adversarial_rounds,
         "baseline_evaluation": baseline_evaluation,
-        "redblue_evaluation": redblue_evaluation,
-        "deltas": metric_deltas(baseline_evaluation, redblue_evaluation),
+        "critic_repairer_evaluation": critic_repairer_evaluation,
+        "deltas": metric_deltas(baseline_evaluation, critic_repairer_evaluation),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -302,7 +302,7 @@ async def run(args: argparse.Namespace) -> Path:
     payload: dict[str, Any] = {
         "experiment_id": args.experiment_id,
         "question_ids": question_ids,
-        "backend": config["model"]["backend_mapping"]["red_agent"],
+        "backend": config["model"]["backend_mapping"]["critic_agent"],
         "adversarial_config": copy.deepcopy(config["adversarial"]),
         "details": [],
     }
@@ -312,7 +312,7 @@ async def run(args: argparse.Namespace) -> Path:
         payload = json.loads(result_path.read_text(encoding="utf-8"))
         if payload.get("question_ids") != question_ids:
             raise ValueError("resume question_ids mismatch")
-        if payload.get("backend") != config["model"]["backend_mapping"]["red_agent"]:
+        if payload.get("backend") != config["model"]["backend_mapping"]["critic_agent"]:
             raise ValueError("resume backend mismatch")
 
     completed = {item["question_id"] for item in payload.get("details", [])}
@@ -336,8 +336,8 @@ async def run(args: argparse.Namespace) -> Path:
                 "status": "failed",
                 "error": str(exc),
                 "elapsed_seconds": 0.0,
-                "red_calls": 0,
-                "blue_calls": 0,
+                "critic_calls": 0,
+                "repairer_calls": 0,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
         finally:
@@ -355,7 +355,7 @@ async def run(args: argparse.Namespace) -> Path:
             f"[{index}/{len(question_ids)}] END {question_id} "
             f"status={detail.get('adversarial_status', detail.get('status'))} "
             f"delta={detail.get('deltas', {}).get('composite_score')} "
-            f"calls={detail.get('red_calls', 0)}+{detail.get('blue_calls', 0)}",
+            f"calls={detail.get('critic_calls', 0)}+{detail.get('repairer_calls', 0)}",
             flush=True,
         )
     payload["summary"] = summarize(payload.get("details", []))
@@ -369,7 +369,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None)
     parser.add_argument("--baseline-root", default="outputs/evaluation")
     parser.add_argument("--output-dir", default="outputs/evaluation")
-    parser.add_argument("--experiment-id", default="redblue-baseline-stage1-v1")
+    parser.add_argument("--experiment-id", default="critic_repairer-baseline-stage1-v1")
     parser.add_argument("--question-ids", nargs="*")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()

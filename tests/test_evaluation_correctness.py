@@ -145,7 +145,8 @@ def test_summarizer_catalog_obeys_count_and_character_budgets() -> None:
     catalog = summarizer.collect_sources("q", results)
     prompt = summarizer._build_synthesis_prompt("q", results, catalog)
     assert len(catalog) <= 3
-    assert all(len(source["source_span"]) <= 500 for source in catalog)
+    # Richer exact spans must still fit the per-entry and total prompt budgets.
+    assert all(len(source["source_span"]) <= 900 for source in catalog)
     assert len(prompt.split("# Source Catalog", 1)[1]) < 3000
 
 

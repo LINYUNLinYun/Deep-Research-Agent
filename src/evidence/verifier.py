@@ -242,16 +242,28 @@ class EvidenceVerifier:
         # Citation markers such as ``[1]`` are references, not factual
         # numbers.  Counting them as claims creates deterministic false
         # contradictions whenever a source snippet omits the marker.
-        claim_numbers = set(self._NUMBER_RE.findall(re.sub(r"\[\d+\]", "", claim.text)))
+        numeric_text = re.sub(r"\[\d+\]", "", claim.text)
+        numeric_text = re.sub(r"^\s*\d+[.)、]\s*", "", numeric_text)
+        claim_numbers = self._numbers(numeric_text)
         claim_negated = bool(self._NEGATION_RE.search(claim.text))
         for source in candidates:
             text = " ".join(filter(None, [source.title, source.source_span]))
             source_tokens = self._tokens(text)
             overlap = self._weighted_overlap(claim_tokens, source_tokens)
-            source_numbers = set(self._NUMBER_RE.findall(text))
+            source_numbers = self._numbers(text)
             number_mismatch = bool(claim_numbers and source_numbers and not claim_numbers.issubset(source_numbers))
-            source_negated = bool(self._NEGATION_RE.search(text))
-            contradiction = number_mismatch or (claim_negated != source_negated and overlap >= self.min_overlap)
+            # Negation in an unrelated sentence cannot contradict the cited
+            # fact. Compare polarity only in the closest source sentence.
+            sentences = self._split_sentences(source.source_span)
+            closest = max(sentences, key=lambda s: self._weighted_overlap(claim_tokens, self._tokens(s)), default="")
+            source_negated = bool(self._NEGATION_RE.search(closest))
+            # Missing numbers in a partial excerpt are an evidence gap, not
+            # proof of an opposing fact. Assert a numeric conflict only when
+            # the closest sentence describes the same numeric proposition.
+            numeric_conflict = number_mismatch and (
+                self._numeric_skeleton(numeric_text) == self._numeric_skeleton(closest)
+            )
+            contradiction = numeric_conflict or (claim_negated != source_negated and overlap >= self.min_overlap)
             scored.append((overlap, source, contradiction))
         scored.sort(key=lambda item: item[0], reverse=True)
         best_overlap, best_source, contradiction = scored[0]
@@ -259,7 +271,8 @@ class EvidenceVerifier:
             status = VerificationStatus.CONTRADICTED
             confidence = min(1.0, 0.55 + best_overlap * 0.45)
             reason = "source_span_conflicts_with_claim"
-        elif best_overlap >= self.min_overlap and best_source.source_span.strip():
+        elif (best_overlap >= self.min_overlap and best_source.source_span.strip()
+              and claim_numbers.issubset(self._numbers(best_source.source_span))):
             status = VerificationStatus.SUPPORTED
             confidence = min(1.0, 0.45 + best_overlap * 0.55)
             reason = "source_span_supports_claim"
@@ -280,6 +293,17 @@ class EvidenceVerifier:
             evidence=[best_source],
             reason=reason,
         )
+
+    def _numbers(self, text: str) -> set[str]:
+        # Grouping commas are formatting, not separate factual quantities.
+        text = re.sub(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?", lambda m: m.group().replace(",", ""), text)
+        return set(self._NUMBER_RE.findall(text))
+
+    def _numeric_skeleton(self, text: str) -> str:
+        text = re.sub(r"\[\d+\]", "", text.lower())
+        text = re.sub(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?", lambda m: m.group().replace(",", ""), text)
+        text = self._NUMBER_RE.sub("NUMBER", text)
+        return re.sub(r"[\W_]+", "", text)
 
     def _merge_policy_result(self, baseline: VerificationResult, candidate: Any) -> VerificationResult:
         if isinstance(candidate, VerificationResult):

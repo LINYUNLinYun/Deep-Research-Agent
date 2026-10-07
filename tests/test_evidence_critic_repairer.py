@@ -4,10 +4,10 @@ import asyncio
 import json
 import time
 
-from src.adversarial.blue_agent import BlueAgent
+from src.adversarial.repairer_agent import RepairerAgent
 from src.adversarial.loop import AdversarialLoop
-from src.adversarial.red_agent import RedAgent
-from src.adversarial.verdict import Dimension, FixOperation, FixType, Issue, RedVerdict, Severity
+from src.adversarial.critic_agent import CriticAgent
+from src.adversarial.verdict import Dimension, FixOperation, FixType, Issue, CriticVerdict, Severity
 from src.evidence import EvidenceVerifier, VerificationStatus
 from src.tools.search_controller import SearchController
 from src.orchestrator.orchestrator import Orchestrator
@@ -49,20 +49,20 @@ def test_evidence_verifier_resolves_explicit_citation_id_and_source_id() -> None
     assert result.evidence[0].metadata["source_id"] == "src_official"
 
 
-def test_blue_merge_preserves_unseen_report_suffix() -> None:
-    blue = BlueAgent(policy=lambda _: {"content": ""})
+def test_repairer_merge_preserves_unseen_report_suffix() -> None:
+    repairer = RepairerAgent(policy=lambda _: {"content": ""})
     original = "HEAD\n" + ("middle\n" * 900) + "TAIL"
     candidate = "HEAD\ncorrected excerpt"
-    merged = blue._merge_fixed_content(original, candidate, [])
+    merged = repairer._merge_fixed_content(original, candidate, [])
     assert merged == original
-    patched = blue._merge_fixed_content(
+    patched = repairer._merge_fixed_content(
         original,
         candidate,
         [{"before": "TAIL", "after": "FINAL"}],
     )
     assert patched.endswith("FINAL")
     assert "middle" in patched
-    patch_only = blue._merge_fixed_content(
+    patch_only = repairer._merge_fixed_content(
         original,
         "",
         [{"before": "TAIL", "after": "PATCHED"}],
@@ -71,24 +71,24 @@ def test_blue_merge_preserves_unseen_report_suffix() -> None:
 
 
 def test_adversarial_context_budgets_are_configurable_and_bounded() -> None:
-    red = RedAgent(policy=lambda _: {}, context_chars=9000)
-    blue = BlueAgent(
+    critic = CriticAgent(policy=lambda _: {}, context_chars=9000)
+    repairer = RepairerAgent(
         policy=lambda _: {},
         repair_context_chars=10000,
         self_verify_context_chars=7000,
     )
     content = "x" * 20000
-    assert len(red._excerpt(content, red.context_chars)) == 9000
-    assert len(blue._truncate_content(content)) == 10000
-    assert blue.self_verify_context_chars == 7000
+    assert len(critic._excerpt(content, critic.context_chars)) == 9000
+    assert len(repairer._truncate_content(content)) == 10000
+    assert repairer.self_verify_context_chars == 7000
 
-    capped_red = RedAgent(policy=lambda _: {}, context_chars=100000)
-    capped_blue = BlueAgent(policy=lambda _: {}, repair_context_chars=100000)
-    assert capped_red.context_chars == 32000
-    assert capped_blue.repair_context_chars == 32000
+    capped_critic = CriticAgent(policy=lambda _: {}, context_chars=100000)
+    capped_repairer = RepairerAgent(policy=lambda _: {}, repair_context_chars=100000)
+    assert capped_critic.context_chars == 32000
+    assert capped_repairer.repair_context_chars == 32000
 
 
-def test_blue_issue_context_centers_long_report_on_exact_claim() -> None:
+def test_repairer_issue_context_centers_long_report_on_exact_claim() -> None:
     claim = "关键事实显示该指标达到42%，但来源并未支持"
     content = (
         "HEAD\n" + ("intro filler " * 180) + "\n\n"
@@ -103,7 +103,7 @@ def test_blue_issue_context_centers_long_report_on_exact_claim() -> None:
         "核心章节",
         FixType.IN_PLACE,
     )
-    context = BlueAgent(policy=lambda _: {}, repair_context_chars=1800)._build_issue_context(
+    context = RepairerAgent(policy=lambda _: {}, repair_context_chars=1800)._build_issue_context(
         ResearchReport("q", content, sources), issue
     )
     assert context.matched_by == "exact_claim"
@@ -115,7 +115,7 @@ def test_blue_issue_context_centers_long_report_on_exact_claim() -> None:
     assert len(context.excerpt) <= 1800
 
 
-def test_blue_issue_context_matches_model_authored_section_location() -> None:
+def test_repairer_issue_context_matches_model_authored_section_location() -> None:
     content = (
         "## 执行摘要\nsummary\n\n"
         "### 2.1 硬件平台与出货量\nwrong section\n\n"
@@ -129,7 +129,7 @@ def test_blue_issue_context_matches_model_authored_section_location() -> None:
         "执行摘要及 2.2 节“苹果侧”",
         FixType.IN_PLACE,
     )
-    context = BlueAgent(policy=lambda _: {})._build_issue_context(
+    context = RepairerAgent(policy=lambda _: {})._build_issue_context(
         ResearchReport("q", content), issue
     )
     assert context.matched_by == "heading"
@@ -138,7 +138,7 @@ def test_blue_issue_context_matches_model_authored_section_location() -> None:
     assert "2.3 内容创作" not in context.target_text
 
 
-def test_blue_issue_context_does_not_target_paper_title_in_references() -> None:
+def test_repairer_issue_context_does_not_target_paper_title_in_references() -> None:
     content = (
         "## 正文\n\n正文中的保险定价论述[1]。\n\n"
         "## 元信息\nmetadata\n\n## 参考来源\n"
@@ -151,7 +151,7 @@ def test_blue_issue_context_does_not_target_paper_title_in_references() -> None:
         "正文",
         FixType.IN_PLACE,
     )
-    context = BlueAgent(policy=lambda _: {})._build_issue_context(
+    context = RepairerAgent(policy=lambda _: {})._build_issue_context(
         ResearchReport("q", content), issue
     )
     assert context.matched_by == "heading"
@@ -159,18 +159,18 @@ def test_blue_issue_context_does_not_target_paper_title_in_references() -> None:
     assert "参考来源" not in context.target_text
 
 
-def test_blue_merge_rejects_patch_outside_or_ambiguous_in_target() -> None:
-    blue = BlueAgent(policy=lambda _: {})
+def test_repairer_merge_rejects_patch_outside_or_ambiguous_in_target() -> None:
+    repairer = RepairerAgent(policy=lambda _: {})
     original = "outside sentence\n\ntarget sentence\n\nending"
     start = original.index("target sentence")
     end = start + len("target sentence")
-    assert blue._merge_fixed_content(
+    assert repairer._merge_fixed_content(
         original,
         "",
         [{"before": "outside sentence", "after": "changed outside"}],
         target_range=(start, end),
     ) == original
-    assert "fixed target" in blue._merge_fixed_content(
+    assert "fixed target" in repairer._merge_fixed_content(
         original,
         "",
         [{"before": "target sentence", "after": "fixed target"}],
@@ -178,7 +178,7 @@ def test_blue_merge_rejects_patch_outside_or_ambiguous_in_target() -> None:
     )
 
     repeated = "same sentence\n\nsame sentence"
-    assert blue._merge_fixed_content(
+    assert repairer._merge_fixed_content(
         repeated,
         "",
         [{"before": "same sentence", "after": "changed"}],
@@ -186,33 +186,33 @@ def test_blue_merge_rejects_patch_outside_or_ambiguous_in_target() -> None:
     ) == repeated
 
 
-def test_blue_self_verify_handles_dimension_without_name_error() -> None:
+def test_repairer_self_verify_handles_dimension_without_name_error() -> None:
     class Policy:
         def __call__(self, _messages):
             return {"content": json.dumps({"has_new_issue": True, "new_issues": [{"description": "x"}]})}
 
     async def run():
-        return await BlueAgent(Policy())._self_verify("old", "new", [])
+        return await RepairerAgent(Policy())._self_verify("old", "new", [])
 
     ok, issues = asyncio.run(run())
     assert not ok
     assert issues and issues[0].dimension is Dimension.LOGICAL
 
 
-def test_blue_self_verify_accepts_fenced_json() -> None:
+def test_repairer_self_verify_accepts_fenced_json() -> None:
     class Policy:
         def __call__(self, _messages):
             return {"content": '```json\n{"has_new_issue": false, "new_issues": []}\n```'}
 
     async def run():
-        return await BlueAgent(Policy())._self_verify("old", "new", [])
+        return await RepairerAgent(Policy())._self_verify("old", "new", [])
 
     ok, issues = asyncio.run(run())
     assert ok
     assert issues == []
 
 
-def test_blue_supplementary_search_uses_shared_controller_budget() -> None:
+def test_repairer_supplementary_search_uses_shared_controller_budget() -> None:
     class Search:
         name = "web_search"
 
@@ -227,7 +227,7 @@ def test_blue_supplementary_search_uses_shared_controller_budget() -> None:
 
     search = Search()
     controller = SearchController(max_backend_calls=1, max_rewrites=0)
-    blue = BlueAgent(
+    repairer = RepairerAgent(
         policy=lambda _messages: {"content": "{}"},
         tools=[search],
         search_controller=controller,
@@ -236,22 +236,22 @@ def test_blue_supplementary_search_uses_shared_controller_budget() -> None:
     report = ResearchReport("q", "claim", [])
 
     async def run():
-        await blue._do_supplementary_search(report, issue)
+        await repairer._do_supplementary_search(report, issue)
         second_issue = Issue(
             Severity.MAJOR, Dimension.FACTUAL, "verify another claim", "p2", FixType.SUPPLEMENTARY
         )
-        return await blue._do_supplementary_search(report, second_issue)
+        return await repairer._do_supplementary_search(report, second_issue)
 
     second = asyncio.run(run())
     assert search.calls == 1
     assert second.action == "supplementary_search_failed"
     events = controller.snapshot()["events"]
-    assert [event["stage"] for event in events] == ["blue", "blue"]
+    assert [event["stage"] for event in events] == ["repairer", "repairer"]
     assert events[-1]["hard_cap_reached"] is True
 
 
 def test_adversarial_loop_final_score_is_post_fix_score() -> None:
-    class Red:
+    class Critic:
         def __init__(self):
             self.calls = 0
 
@@ -259,10 +259,10 @@ def test_adversarial_loop_final_score_is_post_fix_score() -> None:
             self.calls += 1
             if self.calls == 1:
                 issue = Issue(Severity.MAJOR, Dimension.FACTUAL, "bad", "p1", FixType.IN_PLACE)
-                return RedVerdict({Dimension.FACTUAL: 4.0}, 4.0, [issue])
-            return RedVerdict({Dimension.FACTUAL: 9.0}, 9.0, [])
+                return CriticVerdict({Dimension.FACTUAL: 4.0}, 4.0, [issue])
+            return CriticVerdict({Dimension.FACTUAL: 9.0}, 9.0, [])
 
-    class Blue:
+    class Repairer:
         status = "success"
         error = ""
 
@@ -271,7 +271,7 @@ def test_adversarial_loop_final_score_is_post_fix_score() -> None:
             return fixed, [FixOperation(verdict.issues[0], "fix", True)]
 
     async def run():
-        return await AdversarialLoop(Red(), Blue(), max_rounds=2, score_threshold=8).run(
+        return await AdversarialLoop(Critic(), Repairer(), max_rounds=2, score_threshold=8).run(
             ResearchReport("q", "old")
         )
 
@@ -282,7 +282,7 @@ def test_adversarial_loop_final_score_is_post_fix_score() -> None:
     assert history[0]["post_fix_score"] == 9.0
 
 
-def test_red_agent_deduplicates_and_caps_issues() -> None:
+def test_critic_agent_deduplicates_and_caps_issues() -> None:
     class Policy:
         def __call__(self, _messages):
             issue = {
@@ -294,7 +294,7 @@ def test_red_agent_deduplicates_and_caps_issues() -> None:
             return {"content": json.dumps({"score": 4, "issues": [issue, issue]})}
 
     async def run():
-        agent = RedAgent(Policy(), max_issues=2)
+        agent = CriticAgent(Policy(), max_issues=2)
         verdict = await agent.attack(ResearchReport("q", "content"))
         return agent, verdict
 
@@ -304,7 +304,7 @@ def test_red_agent_deduplicates_and_caps_issues() -> None:
     assert verdict.issue_stats == agent.last_issue_stats
 
 
-def test_red_agent_prompt_bounds_dimension_issue_output() -> None:
+def test_critic_agent_prompt_bounds_dimension_issue_output() -> None:
     class Policy:
         def __init__(self):
             self.prompts = []
@@ -315,7 +315,7 @@ def test_red_agent_prompt_bounds_dimension_issue_output() -> None:
 
     async def run():
         policy = Policy()
-        await RedAgent(policy, max_issues_per_dimension=2).attack(ResearchReport("q", "content"))
+        await CriticAgent(policy, max_issues_per_dimension=2).attack(ResearchReport("q", "content"))
         return policy
 
     policy = asyncio.run(run())
@@ -323,7 +323,7 @@ def test_red_agent_prompt_bounds_dimension_issue_output() -> None:
     assert all("最多 2 个" in prompt for prompt in policy.prompts)
 
 
-def test_red_agent_retries_only_the_malformed_dimension() -> None:
+def test_critic_agent_retries_only_the_malformed_dimension() -> None:
     class Policy:
         def __init__(self):
             self.calls = 0
@@ -336,7 +336,7 @@ def test_red_agent_retries_only_the_malformed_dimension() -> None:
 
     async def run():
         policy = Policy()
-        agent = RedAgent(policy, dimension_parse_retries=1)
+        agent = CriticAgent(policy, dimension_parse_retries=1)
         verdict = await agent.attack(ResearchReport("q", "content"))
         return policy, agent, verdict
 
@@ -347,20 +347,20 @@ def test_red_agent_retries_only_the_malformed_dimension() -> None:
     assert verdict.retry_stats == agent.last_retry_stats
 
 
-def test_adversarial_loop_records_failed_red_attempt() -> None:
-    class Red:
+def test_adversarial_loop_records_failed_critic_attempt() -> None:
+    class Critic:
         async def attack(self, report):
-            return RedVerdict(
+            return CriticVerdict(
                 {Dimension.FACTUAL: 0}, 0, [], "invalid output",
                 status="failed", error="invalid JSON",
             )
 
-    class Blue:
+    class Repairer:
         async def defend(self, report, verdict):
-            raise AssertionError("Blue must not run after failed Red")
+            raise AssertionError("Repairer must not run after failed Critic")
 
     async def run():
-        return await AdversarialLoop(Red(), Blue()).run(ResearchReport("q", "old"))
+        return await AdversarialLoop(Critic(), Repairer()).run(ResearchReport("q", "old"))
 
     report, history = asyncio.run(run())
     assert report.adversarial_status == "skipped"
@@ -370,24 +370,24 @@ def test_adversarial_loop_records_failed_red_attempt() -> None:
     assert history[0]["outcome"] == "failed"
 
 
-def test_adversarial_loop_keeps_best_report_after_later_red_failure() -> None:
+def test_adversarial_loop_keeps_best_report_after_later_critic_failure() -> None:
     issue = Issue(Severity.MAJOR, Dimension.FACTUAL, "bad", "p1", FixType.IN_PLACE)
 
-    class Red:
+    class Critic:
         def __init__(self):
             self.calls = 0
 
         async def attack(self, report):
             self.calls += 1
             if self.calls == 1:
-                return RedVerdict({Dimension.FACTUAL: 4}, 4, [issue])
+                return CriticVerdict({Dimension.FACTUAL: 4}, 4, [issue])
             if self.calls == 2:
-                return RedVerdict({Dimension.FACTUAL: 9}, 9, [])
-            return RedVerdict(
+                return CriticVerdict({Dimension.FACTUAL: 9}, 9, [])
+            return CriticVerdict(
                 {Dimension.FACTUAL: 0}, 0, [], status="failed", error="invalid JSON"
             )
 
-    class Blue:
+    class Repairer:
         status = "success"
         error = ""
 
@@ -397,7 +397,7 @@ def test_adversarial_loop_keeps_best_report_after_later_red_failure() -> None:
 
     async def run():
         return await AdversarialLoop(
-            Red(), Blue(), max_rounds=2, score_threshold=10
+            Critic(), Repairer(), max_rounds=2, score_threshold=10
         ).run(ResearchReport("q", "old"))
 
     report, history = asyncio.run(run())
@@ -408,23 +408,23 @@ def test_adversarial_loop_keeps_best_report_after_later_red_failure() -> None:
     assert history[-1]["fallback_to_best"] is True
 
 
-def test_adversarial_loop_keeps_best_report_after_later_blue_failure() -> None:
+def test_adversarial_loop_keeps_best_report_after_later_repairer_failure() -> None:
     first = Issue(Severity.MAJOR, Dimension.FACTUAL, "first", "p1", FixType.IN_PLACE)
     second = Issue(Severity.MAJOR, Dimension.LOGICAL, "second", "p2", FixType.IN_PLACE)
 
-    class Red:
+    class Critic:
         def __init__(self):
             self.calls = 0
 
         async def attack(self, report):
             self.calls += 1
             if self.calls == 1:
-                return RedVerdict({Dimension.FACTUAL: 4}, 4, [first])
+                return CriticVerdict({Dimension.FACTUAL: 4}, 4, [first])
             if self.calls == 2:
-                return RedVerdict({Dimension.FACTUAL: 9}, 9, [])
-            return RedVerdict({Dimension.FACTUAL: 8}, 8, [second])
+                return CriticVerdict({Dimension.FACTUAL: 9}, 9, [])
+            return CriticVerdict({Dimension.FACTUAL: 8}, 8, [second])
 
-    class Blue:
+    class Repairer:
         error = ""
 
         def __init__(self):
@@ -443,7 +443,7 @@ def test_adversarial_loop_keeps_best_report_after_later_blue_failure() -> None:
 
     async def run():
         return await AdversarialLoop(
-            Red(), Blue(), max_rounds=2, score_threshold=10
+            Critic(), Repairer(), max_rounds=2, score_threshold=10
         ).run(ResearchReport("q", "old"))
 
     report, history = asyncio.run(run())
@@ -454,14 +454,14 @@ def test_adversarial_loop_keeps_best_report_after_later_blue_failure() -> None:
     assert history[-1]["fallback_to_best"] is True
 
 
-def test_blue_agent_rolls_back_only_unverified_fix() -> None:
+def test_repairer_agent_rolls_back_only_unverified_fix() -> None:
     issues = [
         Issue(Severity.MAJOR, Dimension.FACTUAL, "one", "p1", FixType.IN_PLACE),
         Issue(Severity.MAJOR, Dimension.LOGICAL, "two", "p2", FixType.IN_PLACE),
         Issue(Severity.MINOR, Dimension.COVERAGE, "three", "p3", FixType.IN_PLACE),
     ]
 
-    class Blue(BlueAgent):
+    class Repairer(RepairerAgent):
         def __init__(self):
             super().__init__(policy=lambda _: {})
             self.verifications = 0
@@ -472,26 +472,29 @@ def test_blue_agent_rolls_back_only_unverified_fix() -> None:
 
         async def _self_verify(self, original, revised, operations):
             self.verifications += 1
+            assert len(operations) == 1
+            assert operations[0].issue.description == issues[self.verifications - 1].description
+            assert operations[0].success
             if self.verifications != 2:
                 return True, []
             return False, [Issue(Severity.MAJOR, Dimension.LOGICAL, "new", "p3")]
 
     async def run():
-        blue = Blue()
-        report, operations = await blue.defend(
+        repairer = Repairer()
+        report, operations = await repairer.defend(
             ResearchReport("q", "old"),
-            RedVerdict({Dimension.FACTUAL: 4}, 4, issues),
+            CriticVerdict({Dimension.FACTUAL: 4}, 4, issues),
         )
-        return blue, report, operations
+        return repairer, report, operations
 
-    blue, report, operations = asyncio.run(run())
+    repairer, report, operations = asyncio.run(run())
     assert report.content == "old|one|three"
-    assert blue.status == "partial"
+    assert repairer.status == "partial"
     assert operations[0].success is True
     assert operations[1].success is False
     assert "rolled_back_after_self_verify" in operations[1].detail
     assert operations[3].success is True
-    assert blue.last_repair_stats == {
+    assert repairer.last_repair_stats == {
         "selected": 3,
         "attempted": 3,
         "committed": 2,
@@ -500,13 +503,13 @@ def test_blue_agent_rolls_back_only_unverified_fix() -> None:
     }
 
 
-def test_blue_agent_stops_after_bounded_consecutive_failures() -> None:
+def test_repairer_agent_stops_after_bounded_consecutive_failures() -> None:
     issues = [
         Issue(Severity.MAJOR, Dimension.FACTUAL, name, name, FixType.IN_PLACE)
         for name in ("one", "two", "three")
     ]
 
-    class Blue(BlueAgent):
+    class Repairer(RepairerAgent):
         def __init__(self):
             super().__init__(policy=lambda _: {}, max_consecutive_failures=2)
 
@@ -514,39 +517,41 @@ def test_blue_agent_stops_after_bounded_consecutive_failures() -> None:
             return FixOperation(issue, "candidate_rejected", False, issue.description)
 
     async def run():
-        blue = Blue()
-        report, operations = await blue.defend(
+        repairer = Repairer()
+        report, operations = await repairer.defend(
             ResearchReport("q", "old"),
-            RedVerdict({Dimension.FACTUAL: 4}, 4, issues),
+            CriticVerdict({Dimension.FACTUAL: 4}, 4, issues),
         )
-        return blue, report, operations
+        return repairer, report, operations
 
-    blue, report, operations = asyncio.run(run())
+    repairer, report, operations = asyncio.run(run())
     assert report.content == "old"
     assert len(operations) == 2
-    assert blue.status == "failed"
-    assert blue.last_repair_stats["skipped_after_failure_cap"] == 1
+    assert repairer.status == "failed"
+    assert repairer.last_repair_stats["skipped_after_failure_cap"] == 1
 
 
-def test_blue_supplementary_sources_are_bound_to_report_citations() -> None:
-    blue = BlueAgent(policy=lambda _: {})
+def test_repairer_supplementary_sources_are_bound_to_report_citations() -> None:
+    repairer = RepairerAgent(policy=lambda _: {})
     report = ResearchReport(
         "q",
         "Claim before [1].",
         [{"title": "Existing", "url": "https://old.test", "snippet": "old"}],
     )
     candidates = [{"title": "New evidence", "url": "https://new.test", "snippet": "supports claim"}]
-    changes, additions, references, error = blue._prepare_supplementary_changes(
+    changes, additions, references, error = repairer._prepare_supplementary_changes(
         report,
         [{"before": "Claim before [1].", "after": "Claim after {{SOURCE_1}}."}],
         candidates,
     )
     assert error == ""
     assert changes[0]["after"] == "Claim after [2]."
-    assert additions == candidates
+    assert additions[0]["url"] == candidates[0]["url"]
+    assert additions[0]["snippet"] == candidates[0]["snippet"]
+    assert additions[0]["citation_id"] == 2
     assert references[0].startswith("[2] [New evidence](https://new.test)")
 
-    bracketed, _, _, error = blue._prepare_supplementary_changes(
+    bracketed, _, _, error = repairer._prepare_supplementary_changes(
         report,
         [{"before": "Claim before [1].", "after": "Claim after [{{SOURCE_1}}]."}],
         candidates,
@@ -555,10 +560,10 @@ def test_blue_supplementary_sources_are_bound_to_report_citations() -> None:
     assert bracketed[0]["after"] == "Claim after [2]."
 
 
-def test_blue_rejects_unbound_numeric_citation_from_supplementary_fix() -> None:
-    blue = BlueAgent(policy=lambda _: {})
+def test_repairer_rejects_unbound_numeric_citation_from_supplementary_fix() -> None:
+    repairer = RepairerAgent(policy=lambda _: {})
     report = ResearchReport("q", "Claim [1].", [{"url": "https://old.test"}])
-    prepared = blue._prepare_supplementary_changes(
+    prepared = repairer._prepare_supplementary_changes(
         report,
         [{"before": "Claim [1].", "after": "Claim [99]."}],
         [{"title": "New", "url": "https://new.test", "snippet": "evidence"}],
@@ -567,30 +572,30 @@ def test_blue_rejects_unbound_numeric_citation_from_supplementary_fix() -> None:
     assert "[99]" in prepared[3]
 
 
-def test_blue_self_verify_context_focuses_on_changed_region() -> None:
+def test_repairer_self_verify_context_focuses_on_changed_region() -> None:
     original = "HEAD " + ("unrelated " * 1000) + "old fact" + (" tail" * 1000)
     revised = original.replace("old fact", "new fact")
-    before, after = BlueAgent._change_contexts(original, revised)
+    before, after = RepairerAgent._change_contexts(original, revised)
     assert "old fact" in before
     assert "new fact" in after
     assert "HEAD" not in before
     assert len(before) <= 4000
 
     with_source = revised + "\n\n### 补充来源\n[2] [Source](https://source.test) — evidence"
-    _, after_with_source = BlueAgent._change_contexts(original, with_source)
+    _, after_with_source = RepairerAgent._change_contexts(original, with_source)
     assert "### 补充来源" in after_with_source
     assert "https://source.test" in after_with_source
 
 
-def test_adversarial_loop_keeps_verified_partial_blue_result() -> None:
+def test_adversarial_loop_keeps_verified_partial_repairer_result() -> None:
     issue = Issue(Severity.MAJOR, Dimension.FACTUAL, "bad", "p1", FixType.IN_PLACE)
 
-    class Red:
+    class Critic:
         async def attack(self, report):
             score = 9.0 if report.content.endswith("fixed") else 4.0
-            return RedVerdict({Dimension.FACTUAL: score}, score, [] if score > 4 else [issue])
+            return CriticVerdict({Dimension.FACTUAL: score}, score, [] if score > 4 else [issue])
 
-    class Blue:
+    class Repairer:
         status = "partial"
         error = "second repair failed"
 
@@ -600,7 +605,7 @@ def test_adversarial_loop_keeps_verified_partial_blue_result() -> None:
             ]
 
     async def run():
-        return await AdversarialLoop(Red(), Blue(), max_rounds=2).run(
+        return await AdversarialLoop(Critic(), Repairer(), max_rounds=2).run(
             ResearchReport("q", "old")
         )
 
@@ -615,12 +620,12 @@ def test_adversarial_loop_keeps_verified_partial_blue_result() -> None:
 def test_adversarial_loop_rejects_post_fix_score_regression() -> None:
     issue = Issue(Severity.MAJOR, Dimension.FACTUAL, "bad", "p1", FixType.IN_PLACE)
 
-    class Red:
+    class Critic:
         async def attack(self, report):
             score = 4.0 if report.content.endswith("worse") else 5.0
-            return RedVerdict({Dimension.FACTUAL: score}, score, [issue])
+            return CriticVerdict({Dimension.FACTUAL: score}, score, [issue])
 
-    class Blue:
+    class Repairer:
         status = "success"
         error = ""
 
@@ -630,7 +635,7 @@ def test_adversarial_loop_rejects_post_fix_score_regression() -> None:
             ]
 
     async def run():
-        return await AdversarialLoop(Red(), Blue(), max_rounds=1).run(
+        return await AdversarialLoop(Critic(), Repairer(), max_rounds=1).run(
             ResearchReport("q", "old")
         )
 

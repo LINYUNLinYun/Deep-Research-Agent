@@ -56,20 +56,20 @@ def test_recorded_error_is_not_fixture_coverage_mismatch():
         store.replay("web_search", {"query": "missing"})
 
 
-def test_attach_replay_tools_replaces_blue_agent_cached_tool():
+def test_attach_replay_tools_replaces_repairer_agent_cached_tool():
     original = Tool()
-    blue = SimpleNamespace(tools=[original], _search_tool=original)
+    repairer = SimpleNamespace(tools=[original], _search_tool=original)
     modules = {
         "tools": [original],
-        "adversarial": SimpleNamespace(blue_agent=blue),
+        "adversarial": SimpleNamespace(repairer_agent=repairer),
     }
     store = RecordReplayStore()
     store.record("web_search", {"query": "frozen"}, response={"results": [1]})
 
     attach_replay_tools(modules, store)
 
-    assert isinstance(blue._search_tool, ReplayToolAdapter)
-    assert blue.tools == modules["tools"]
-    assert asyncio.run(blue._search_tool.execute(query="frozen")) == {"results": [1]}
+    assert isinstance(repairer._search_tool, ReplayToolAdapter)
+    assert repairer.tools == modules["tools"]
+    assert asyncio.run(repairer._search_tool.execute(query="frozen")) == {"results": [1]}
     with pytest.raises(ReplayMismatchError):
-        asyncio.run(blue._search_tool.execute(query="not-recorded"))
+        asyncio.run(repairer._search_tool.execute(query="not-recorded"))

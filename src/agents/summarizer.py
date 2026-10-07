@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import re
 from datetime import datetime
 from typing import Any
@@ -18,8 +19,9 @@ from .base_agent import BaseAgent
 from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus, ResearchReport
 from ..utils.tracing import trace_agent
 from ..utils.runtime_context import runtime_context_text
-from ..utils.temporal import infer_source_date
+from ..utils.temporal import infer_source_date, temporal_relevance
 from ..evidence import EvidenceLedger
+from ..evidence.projection import relevance, remap_citations
 
 
 __all__ = ["SummarizerAgent"]
@@ -90,7 +92,7 @@ class SummarizerAgent(BaseAgent):
             # 合成任务不需要工具调用，临时禁用 tools 避免模型进入 tool-calling 模式
             old_tools = getattr(self.policy, "tools", None)
             self.policy.tools = None
-            response = self.policy(messages)
+            response = await asyncio.to_thread(self.policy, messages)
         except RuntimeError as e:
             return AgentResult(
                 task_id=task.task_id,
@@ -153,6 +155,7 @@ class SummarizerAgent(BaseAgent):
     ) -> str:
         """构建合成 prompt，按置信度降序排列结果。"""
         sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
+        source_catalog = source_catalog if source_catalog is not None else self.collect_sources(query, results)
 
         parts = [
             runtime_context_text() + "\n",
@@ -161,17 +164,18 @@ class SummarizerAgent(BaseAgent):
         ]
         for i, r in enumerate(sorted_results, 1):
             status_icon = "✓" if r.status == AgentStatus.SUCCESS else "✗"
+            worker_output = re.sub(r"\[\d+\]", "", str(r.output))
             parts.append(
                 f"## Result {i} [{status_icon}] (confidence: {r.confidence:.2f})\n"
                 f"Task: {r.task_id}\n"
-                f"Output:\n{r.output}\n"
+                f"Output (worker-local numeric citations are not catalog citations):\n{worker_output}\n"
             )
 
         if prior_report is not None and prior_report.content:
             parts.append(
                 "\n# Prior Verified Draft\n"
-                "Preserve supported sections verbatim where possible. Revise only claims addressed by new verification evidence.\n"
-                f"{prior_report.content}\n"
+                "This draft is NOT fully verified. Numeric citations below were remapped to the current catalog. Recheck every claim against that catalog; omit unsupported numbers and correct mismatched references. Preserve only supported content.\n"
+                f"{remap_citations(prior_report.content, prior_report.sources, source_catalog or [])}\n"
             )
 
         source_catalog = source_catalog if source_catalog is not None else self.collect_sources(query, results)
@@ -181,6 +185,7 @@ class SummarizerAgent(BaseAgent):
                 f"[{source['citation_id']}] {source.get('title', '')}\n"
                 f"Stable source ID: {source.get('source_id', '')}\n"
                 f"URL: {source.get('url', '')}\n"
+                f"Source date: {source.get('source_date') or 'unknown'}; temporal relevance: {source.get('temporal_relevance', 'unknown')}\n"
                 f"Evidence span: {str(source.get('source_span') or source.get('snippet', ''))}\n"
             )
 
@@ -190,6 +195,7 @@ class SummarizerAgent(BaseAgent):
             "2. Use a refer-then-claim loop for each factual sentence: first select the exact evidence span and its catalog ID, "
             "then write one atomic sentence supported by that span and append [N] immediately.\n"
             "3. Never introduce a new factual detail while paraphrasing. Separate analysis/inference from sourced facts.\n"
+            "For relative-time queries, historical_context and unknown-date sources cannot establish current-period facts or performance. Use them only as explicitly dated background. Never move an event date into the query window; disclose missing current-period data.\n"
             "4. Structure only the sections supported by the evidence; do not pad to a minimum length.\n"
             "5. Resolve contradictions explicitly. Every number, date, comparison, causal claim, and externally verifiable fact "
             "MUST cite matching Source Catalog IDs using [N]. Never invent an ID.\n"
@@ -228,7 +234,7 @@ class SummarizerAgent(BaseAgent):
         unique_sources = source_catalog if source_catalog is not None else self.collect_sources(query, results)
 
         # Do not present stale evidence as a high-confidence current answer.
-        is_temporal_query = any(token in query.lower() for token in ("今年", "当前", "目前", "最新", "近期", "最近", "this year", "current", "latest", "recent"))
+        is_temporal_query = any(token in query.lower() for token in ("今年", "当前", "目前", "最新", "近期", "最近", "近一个月", "this year", "current", "latest", "recent"))
         if is_temporal_query and not unique_sources:
             # A current answer with no extracted evidence must not retain the
             # model's optimistic self-reported confidence.
@@ -268,14 +274,19 @@ class SummarizerAgent(BaseAgent):
         successful = [result for result in results if result.status == AgentStatus.SUCCESS]
         max_sources = min(self.max_catalog_sources, max(8, len(successful) * 3))
         sources = EvidenceLedger(max_sources_per_task=8).catalog(successful)
-        sources.sort(key=self._source_priority, reverse=True)
+        sources = [s for s in sources if relevance(query, s) >= 0]
+        for source in sources:
+            source["source_date"] = infer_source_date(source)
+            source["temporal_relevance"] = self._temporal_relevance(query, source["source_date"])
+        temporal_rank = {"current": 3, "not_applicable": 3, "unknown": 1, "historical_context": 0, "future_dated": -1}
+        sources.sort(key=lambda s: (temporal_rank[s["temporal_relevance"]], relevance(query, s), s.get("tool_name") == "verify_result", *self._source_priority(s)), reverse=True)
         bounded: list[dict] = []
         used_chars = 0
         for source in sources:
             item = dict(source)
             # A compact attributable passage is more useful than a long
             # low-ranked snippet. Preserve the full span in the EvidenceBundle.
-            span = str(item.get("source_span") or item.get("snippet", ""))[:500]
+            span = str(item.get("source_span") or item.get("snippet", ""))[:900]
             item["source_span"] = span
             item["snippet"] = str(item.get("snippet", ""))[:300]
             entry_chars = sum(len(str(item.get(key, ""))) for key in (
@@ -315,13 +326,4 @@ class SummarizerAgent(BaseAgent):
 
     @staticmethod
     def _temporal_relevance(query: str, source_date: str | None) -> str:
-        if not any(token in query.lower() for token in ("今年", "当前", "目前", "最新", "近期", "最近", "this year", "current", "latest", "recent")):
-            return "not_applicable"
-        if not source_date:
-            return "unknown"
-        try:
-            source_year = int(str(source_date)[:4])
-            current_year = datetime.now().astimezone().year
-        except (TypeError, ValueError):
-            return "unknown"
-        return "current" if source_year == current_year else ("historical_context" if source_year < current_year else "future_dated")
+        return temporal_relevance(query, source_date)

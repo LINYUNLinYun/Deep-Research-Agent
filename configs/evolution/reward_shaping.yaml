@@ -10,15 +10,15 @@ reward:
   description: "多维度研究质量奖励函数，用于 GRPO 策略梯度优化"
 
   # ---------------------------------------------------------------------------
-  # 五维度评分权重（需与 Red Agent 的五个维度对齐）
+  # 五维度评分权重（需与 Critic Agent 的五个维度对齐）
   # ---------------------------------------------------------------------------
   dimensions:
     factual_accuracy:
       name: "事实准确性"
       # 该维度在总奖励中的权重
       weight: 0.25
-      # 评分来源：red_agent / judge_model / exact_match
-      scorer: "red_agent"
+      # 评分来源：critic_agent / judge_model / exact_match
+      scorer: "critic_agent"
       # 评分范围
       min_score: 0.0
       max_score: 10.0
@@ -26,21 +26,21 @@ reward:
     logical_consistency:
       name: "逻辑一致性"
       weight: 0.20
-      scorer: "red_agent"
+      scorer: "critic_agent"
       min_score: 0.0
       max_score: 10.0
 
     citation_coverage:
       name: "引用覆盖与质量"
       weight: 0.20
-      scorer: "red_agent"
+      scorer: "critic_agent"
       min_score: 0.0
       max_score: 10.0
 
     bias:
       name: "偏见与片面性"
       weight: 0.20
-      scorer: "red_agent"
+      scorer: "critic_agent"
       # 注意：偏见维度得分越高表示偏见越少（即越客观）
       min_score: 0.0
       max_score: 10.0
@@ -48,7 +48,7 @@ reward:
     comprehensiveness:
       name: "完备性与深度"
       weight: 0.15
-      scorer: "red_agent"
+      scorer: "critic_agent"
       min_score: 0.0
       max_score: 10.0
 

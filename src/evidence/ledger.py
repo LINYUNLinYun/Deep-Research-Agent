@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -21,6 +22,19 @@ class EvidenceLedger:
     def collect(self, results: Sequence[Any]) -> EvidenceBundle:
         records: list[SourceRecord] = []
         seen: set[str] = set()
+
+        def enrich(record):
+            if record is None or record.source_id not in seen:
+                return
+            index = next(i for i, old in enumerate(records) if old.source_id == record.source_id)
+            old = records[index]
+            if record.tool_name == "verify_result" and record.source_span not in old.source_span:
+                span = (record.source_span + "\n" + old.source_span)[:self.max_span_chars]
+            else:
+                span = max((old.source_span, record.source_span), key=len)
+            records[index] = replace(old, source_span=span, title=old.title or record.title,
+                                     tool_name="verify_result" if record.tool_name == "verify_result" else old.tool_name,
+                                     content_hash=hashlib.sha256(span.encode("utf-8")).hexdigest())
         for result in results:
             if str(getattr(getattr(result, "status", None), "value", "")) != "success":
                 continue
@@ -32,6 +46,7 @@ class EvidenceLedger:
                 if not isinstance(source, Mapping):
                     continue
                 record = self._record(task_id, str(source.get("tool_name", "bundle")), source)
+                enrich(record)
                 if record is None or record.source_id in seen:
                     continue
                 seen.add(record.source_id)
@@ -47,6 +62,7 @@ class EvidenceLedger:
                 args = step.get("args") if isinstance(step.get("args"), Mapping) else {}
                 for item in self._items(tool_name, result_payload, args):
                     record = self._record(task_id, tool_name, item)
+                    enrich(record)
                     if record is None or record.source_id in seen:
                         continue
                     seen.add(record.source_id)
@@ -73,6 +89,7 @@ class EvidenceLedger:
                             "source_span": item.get("span", ""),
                             "title": item.get("title", ""),
                         })
+                        enrich(record)
                         if record is not None and record.source_id not in seen:
                             seen.add(record.source_id)
                             records.append(record)

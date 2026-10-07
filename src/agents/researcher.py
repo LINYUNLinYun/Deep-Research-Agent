@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from typing import Any
 
@@ -56,9 +57,11 @@ class ResearcherAgent(BaseAgent):
         evidence_gain_threshold: float = 0.15,
         evidence_patience: int = 1,
         max_tool_calls: int | None = None,
+        compressor=None,
     ) -> None:
         super().__init__(name, policy, tools)
         self.max_turns = max_turns
+        self.compressor = compressor
         self.tool_map: dict[str, Any] = {t.name: t for t in (tools or [])}
         self.tool_policy = tool_policy or ToolExecutionPolicy()
         # AgentPool copies the tools list but intentionally shares the tool
@@ -176,6 +179,10 @@ class ResearcherAgent(BaseAgent):
                     })
 
             try:
+                if self.compressor is not None:
+                    messages = await asyncio.to_thread(
+                        self._compress_tool_messages, messages, task.description
+                    )
                 # 使用线程池执行同步 policy，避免阻塞 asyncio 事件循环
                 response = await asyncio.to_thread(self.policy, messages)
             except RuntimeError as e:
@@ -501,6 +508,49 @@ class ResearcherAgent(BaseAgent):
 
         return False
 
+    def _compress_tool_messages(self, messages: list[dict], query: str) -> list[dict]:
+        """Compress tool payloads before the policy's destructive fallback.
+
+        Keep each tool_call_id and its assistant request intact. Raw tool
+        evidence remains in the trajectory rather than being overwritten.
+        """
+        if len(json.dumps(messages, ensure_ascii=False, default=str)) <= 30000:
+            return messages
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        if not tool_messages or not self.compressor.enable_multilevel:
+            return messages
+        overhead = len(json.dumps(
+            [{**m, "content": ""} if m.get("role") == "tool" else m for m in messages],
+            ensure_ascii=False, default=str,
+        ))
+        per_tool_chars = max(500, (30000 - overhead) // len(tool_messages))
+        target_tokens = max(1, int(per_tool_chars / self.compressor.chars_per_token))
+        reserve = max(0, self.compressor.available_budget - target_tokens)
+        result = []
+        for message in messages:
+            if message.get("role") != "tool" or len(message.get("content", "")) <= per_tool_chars:
+                result.append(message)
+                continue
+            try:
+                payload, separator, notice = message["content"].partition("\n\n[SYSTEM NOTICE]")
+                compressed = self.compressor.compress(
+                    [payload], query=query, system_prompt_tokens=reserve,
+                )
+                content = "\n".join(compressed)
+                if content and separator:
+                    content += separator + notice
+                # Never replace evidence with an empty result or a longer summary.
+                if content and len(content) < len(message["content"]):
+                    result.append({**message, "content": content})
+                else:
+                    result.append(message)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Worker tool compression failed; using policy fallback", exc_info=True,
+                )
+                result.append(message)
+        return result
+
     def _build_task_prompt(self, task: SubTask, context: dict) -> str:
         """根据 SubTask 和全局上下文构建 user prompt。"""
         desc_lower = (task.description or "").lower()
@@ -568,7 +618,7 @@ class ResearcherAgent(BaseAgent):
         ])
         if task.search_hints:
             lines.insert(1, f"Search hints (MUST use these as primary keywords): {', '.join(task.search_hints)}")
-        if task.context_keys:
+        if task.context_keys and not context.get("compressed_context"):
             ctx_parts = []
             for key in task.context_keys:
                 if key in context:
@@ -577,7 +627,7 @@ class ResearcherAgent(BaseAgent):
                 lines.append("\n## Context:")
                 lines.extend(ctx_parts)
         dependency_parts = []
-        for dependency_id in task.dependencies:
+        for dependency_id in (task.dependencies if not context.get("compressed_context") else []):
             dependency = context.get(f"dep:{dependency_id}")
             if isinstance(dependency, AgentResult) and dependency.status == AgentStatus.SUCCESS:
                 dependency_parts.append(f"- {dependency_id}: {dependency.output}")
@@ -764,6 +814,12 @@ class ResearcherAgent(BaseAgent):
 
     def _extract_confidence(self, content: str) -> float:
         """从输出文本中尝试提取置信度分数。"""
+        try:
+            verdict = json.loads(content)
+            if isinstance(verdict, dict) and "confidence" in verdict:
+                return max(0.0, min(1.0, float(verdict["confidence"])))
+        except (ValueError, TypeError):
+            pass
         import re
         # 匹配 "Confidence: 0.85" 或 "置信度: 0.85"
         patterns = [

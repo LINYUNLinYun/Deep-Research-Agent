@@ -1,7 +1,7 @@
 """
-M5 Red-Blue 对抗降噪循环 — 评判与数据结构层
+M5 Critic-Repairer 对抗降噪循环 — 评判与数据结构层
 
-本模块定义对抗循环中所有核心数据结构（Issue / RedVerdict / FixOperation）
+本模块定义对抗循环中所有核心数据结构（Issue / CriticVerdict / FixOperation）
 以及评分引擎 VerdictEngine。所有分数区间统一为 [0.0, 10.0]，便于与人类直觉对齐。
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ __all__ = [
     "FixType",
     "Dimension",
     "Issue",
-    "RedVerdict",
+    "CriticVerdict",
     "FixOperation",
     "VerdictEngine",
 ]
@@ -36,14 +36,14 @@ class Severity(Enum):
 
 
 class FixType(Enum):
-    """Blue Agent 修复策略类型。"""
+    """Repairer Agent 修复策略类型。"""
     IN_PLACE = "in_place"      # 原地修正：数字/日期/名字等直接替换
     SUPPLEMENTARY = "search"   # 补充搜索：unsourced claims → 触发新搜索
     REMOVAL = "removal"        # 移除：高置信幻觉段落直接删除
 
 
 class Dimension(Enum):
-    """Red Agent 五维度攻击维度。"""
+    """Critic Agent 五维度攻击维度。"""
     FACTUAL = "fact_check"      # 事实核查
     HALLUCINATION = "hallucination"  # 幻觉检测
     LOGICAL = "logical"         # 逻辑一致性
@@ -57,12 +57,12 @@ class Dimension(Enum):
 
 @dataclass
 class Issue:
-    """Red Agent 发现的单条问题。
+    """Critic Agent 发现的单条问题。
 
     Attributes:
         severity: 严重级别 (critical / major / minor)。
         dimension: 所属攻击维度。
-        description: 自然语言描述，传给 Blue Agent 的指导信息。
+        description: 自然语言描述，传给 Repairer Agent 的指导信息。
         location: 问题在报告中的位置标记，如段落索引或引用标记。
         fix_type: 建议的修复类型。
         evidence: 支撑该 issue 判定的证据片段（如 source 原文）。
@@ -112,8 +112,8 @@ class Issue:
 
 
 @dataclass
-class RedVerdict:
-    """Red Agent 对单份报告的完整攻击结果。
+class CriticVerdict:
+    """Critic Agent 对单份报告的完整攻击结果。
 
     Attributes:
         dimension_scores: 五维度分数，键为 Dimension，值为 [0, 10] 浮点数。
@@ -143,7 +143,7 @@ class RedVerdict:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "RedVerdict":
+    def from_dict(cls, data: dict[str, Any]) -> "CriticVerdict":
         return cls(
             dimension_scores={
                 Dimension(k): v
@@ -161,7 +161,7 @@ class RedVerdict:
 
 @dataclass
 class FixOperation:
-    """Blue Agent 执行的单次修复操作记录。
+    """Repairer Agent 执行的单次修复操作记录。
 
     Attributes:
         issue: 被修复的原始问题。
@@ -188,7 +188,7 @@ class FixOperation:
 # ============================================================================
 
 class VerdictEngine:
-    """Red-Blue 对抗循环的评分引擎。
+    """Critic-Repairer 对抗循环的评分引擎。
 
     设计决策：
     1. 五维度权重与项目计划严格对齐，总和为 1.0。
@@ -288,11 +288,11 @@ class VerdictEngine:
         return sw * dw * fd
 
     @staticmethod
-    def to_json(verdict: RedVerdict, indent: int = 2) -> str:
-        """将 RedVerdict 序列化为 JSON 字符串。"""
+    def to_json(verdict: CriticVerdict, indent: int = 2) -> str:
+        """将 CriticVerdict 序列化为 JSON 字符串。"""
         return json.dumps(verdict.to_dict(), ensure_ascii=False, indent=indent)
 
     @staticmethod
-    def from_json(raw: str) -> RedVerdict:
-        """从 JSON 字符串反序列化 RedVerdict。"""
-        return RedVerdict.from_dict(json.loads(raw))
+    def from_json(raw: str) -> CriticVerdict:
+        """从 JSON 字符串反序列化 CriticVerdict。"""
+        return CriticVerdict.from_dict(json.loads(raw))

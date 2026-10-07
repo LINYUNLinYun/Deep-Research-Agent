@@ -166,16 +166,16 @@ def attach_replay_tools(modules: dict[str, Any], store: RecordReplayStore) -> No
             # Strict replay mismatches must not be hidden by retry/fallback.
             tool_policy.max_retries = 0
 
-    # ``initialize_modules`` constructs the adversarial Blue Agent before the
+    # ``initialize_modules`` constructs the adversarial Repairer Agent before the
     # replay store is attached.  It therefore owns direct references to the
     # original tools and can otherwise bypass the frozen fixture universe via
     # supplementary search.  Replace both its public list and cached search
     # handle with the same replay adapters used by AgentPool.
     adversarial = modules.get("adversarial")
-    blue_agent = getattr(adversarial, "blue_agent", None)
-    if blue_agent is not None:
-        blue_tools = list(getattr(blue_agent, "tools", []) or [])
-        blue_agent.tools = [replacements.get(id(tool), tool) for tool in blue_tools]
-        cached_search = getattr(blue_agent, "_search_tool", None)
+    repairer_agent = getattr(adversarial, "repairer_agent", None)
+    if repairer_agent is not None:
+        repairer_tools = list(getattr(repairer_agent, "tools", []) or [])
+        repairer_agent.tools = [replacements.get(id(tool), tool) for tool in repairer_tools]
+        cached_search = getattr(repairer_agent, "_search_tool", None)
         if cached_search is not None:
-            blue_agent._search_tool = replacements.get(id(cached_search), cached_search)
+            repairer_agent._search_tool = replacements.get(id(cached_search), cached_search)

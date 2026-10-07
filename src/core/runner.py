@@ -271,6 +271,7 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
 
     planner_policy = modules.get("planner_policy", default_policy)
     budget_tracker = BudgetTracker()
+    modules["budget_tracker"] = budget_tracker
     planner = Planner(
         policy=planner_policy,
         budget_tracker=budget_tracker,
@@ -328,14 +329,14 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     modules["tools"] = tools_list
     logger.info(f"Tools 模块已初始化（共 {len(tools_list)} 个工具）")
 
-    # M5: Red-Blue Adversarial Loop（先创建，再注入 Orchestrator）
+    # M5: Critic-Repairer Adversarial Loop（先创建，再注入 Orchestrator）
     from src.adversarial.loop import AdversarialLoop
-    from src.adversarial.red_agent import RedAgent
-    from src.adversarial.blue_agent import BlueAgent
+    from src.adversarial.critic_agent import CriticAgent
+    from src.adversarial.repairer_agent import RepairerAgent
     from src.evidence import EvidenceVerifier
 
-    red_policy = modules.get("red_agent_policy", default_policy)
-    blue_policy = modules.get("blue_agent_policy", default_policy)
+    critic_policy = modules.get("critic_agent_policy", default_policy)
+    repairer_policy = modules.get("repairer_agent_policy", default_policy)
     adversarial_cfg = config.get("adversarial", {})
 
     max_adversarial_issues = adversarial_cfg.get("max_issues_per_round", 5)
@@ -347,24 +348,24 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         ),
         None,
     )
-    red_agent = RedAgent(
-        policy=red_policy,
-        max_tokens=adversarial_cfg.get("red_max_tokens", 4096),
+    critic_agent = CriticAgent(
+        policy=critic_policy,
+        max_tokens=adversarial_cfg.get("critic_max_tokens", 4096),
         max_issues=max_adversarial_issues,
         max_issues_per_dimension=adversarial_cfg.get("max_issues_per_dimension", 2),
         max_sources=adversarial_cfg.get("max_sources", 20),
-        context_chars=adversarial_cfg.get("red_context_chars", 8000),
-        dimension_parse_retries=adversarial_cfg.get("red_dimension_parse_retries", 1),
+        context_chars=adversarial_cfg.get("critic_context_chars", 8000),
+        dimension_parse_retries=adversarial_cfg.get("critic_dimension_parse_retries", 1),
     )
-    blue_agent = BlueAgent(
-        policy=blue_policy,
+    repairer_agent = RepairerAgent(
+        policy=repairer_policy,
         tools=tools_list,
-        max_tokens=adversarial_cfg.get("blue_max_tokens", 4096),
+        max_tokens=adversarial_cfg.get("repairer_max_tokens", 4096),
         max_issues=max_adversarial_issues,
         max_sources=adversarial_cfg.get("max_sources", 20),
         max_consecutive_failures=adversarial_cfg.get("max_consecutive_failures", 2),
         max_candidate_sources=adversarial_cfg.get("max_candidate_sources", 3),
-        repair_context_chars=adversarial_cfg.get("blue_context_chars", 4000),
+        repair_context_chars=adversarial_cfg.get("repairer_context_chars", 4000),
         self_verify_context_chars=adversarial_cfg.get("self_verify_context_chars", 6000),
         search_controller=shared_search_controller,
     )
@@ -379,8 +380,8 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         )
     modules["evidence_verifier"] = evidence_verifier
     adversarial_loop = AdversarialLoop(
-        red_agent=red_agent,
-        blue_agent=blue_agent,
+        critic_agent=critic_agent,
+        repairer_agent=repairer_agent,
         policy=modules.get("judge_policy", default_policy),
         max_rounds=adversarial_cfg.get("max_rounds", 3),
         score_threshold=adversarial_cfg.get("score_threshold", 8.0),
@@ -431,6 +432,7 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         tools_factory=lambda: list(modules["tools"]),
         max_idle=3,
         agent_kwargs={
+            "compressor": compressor,
             "max_turns": config.get("planner", {}).get("max_search_rounds_per_subagent", 5) + 2,
             "tool_policy": ToolExecutionPolicy(
                 max_retries=config.get("orchestrator", {}).get("max_subagent_retries", 2),
@@ -650,6 +652,16 @@ def _format_report(report, elapsed: float) -> str:
         f"- **总耗时**: {elapsed:.2f} 秒",
         "",
     ]
+
+    history = getattr(report, "adversarial_history", [])
+    if history:
+        lines.extend(["## 对抗审查记录", "", "| 轮次 | 维度 | 修复前 | 修复后 | 采纳 |", "|---|---|---:|---:|---|"])
+        for record in history:
+            before = record.get("pre_fix_dimension_scores", record.get("dimension_scores", {}))
+            after = record.get("dimension_scores", {})
+            for dimension in dict.fromkeys([*before, *after]):
+                lines.append(f"| {record['round']} | {dimension} | {before.get(dimension, '—')} | {after.get(dimension, '—')} | {record.get('accepted', False)} |")
+        lines.append("")
 
     if report.sources:
         lines.append("## 参考来源")

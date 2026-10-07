@@ -88,11 +88,11 @@ model:
         temperature: 0.5       # 合成报告：流畅但不发散
         max_tokens: 16384      # 报告可能很长，给足 token 预算
         thinking: false
-      red_agent:
+      critic_agent:
         temperature: 0.1       # 攻击必须严谨，几乎不需要随机性
         max_tokens: 4096
-        thinking: false        # 严格 JSON 输出，避免 reasoning 耗尽输出预算
-      blue_agent:
+        thinking: null         # MiMo 使用后端默认，不发送 DeepSeek 专用 thinking 参数
+      repairer_agent:
         temperature: 0.3       # 修复需要确定性
         max_tokens: 4096
         thinking: false        # 修复与 self-verify 都要求严格 JSON
@@ -112,8 +112,8 @@ model:
     planner: "deepseek"       # 规划器：DeepSeek Flash
     summarizer: "deepseek"    # 合成器：DeepSeek Flash
     judge: "mimo"            # 评分器：Xiaomi MiMo 2.5 Pro
-    red_agent: "deepseek"     # 暂用 DeepSeek；MiMo 凭证恢复并复测后再切回
-    blue_agent: "deepseek"    # 严格 JSON 修复，配合 thinking=false
+    critic_agent: "mimo"         # 独立审查与评分：MiMo
+    repairer_agent: "deepseek"    # 严格 JSON 修复，配合 thinking=false
     compressor: "mimo"        # 上下文压缩：MiMo（摘要任务成本低）
 
 orchestrator:
@@ -195,33 +195,33 @@ memory:
   recency_half_life_days: 30
 
 adversarial:
-  # M5: Red-Blue Adversarial Loop 配置
+  # M5: Critic-Repairer Adversarial Loop 配置
   # 总开关：是否启用对抗降噪流程
   enabled: true
-  # Red-Blue 对抗最大轮数
+  # Critic-Repairer 对抗最大轮数
   max_rounds: 3
-  # 单轮只修复最高优先级问题，限制 Red-Blue 调用放大。
+  # 单轮只修复最高优先级问题，限制 Critic-Repairer 调用放大。
   max_issues_per_round: 5
-  # Red 每个维度最多输出的问题数；总列表仍按上面的 Top-K 截断。
+  # Critic 每个维度最多输出的问题数；总列表仍按上面的 Top-K 截断。
   max_issues_per_dimension: 2
-  max_sources: 20
+  max_sources: 24
   # 单项候选失败只回滚该项；连续失败达到此值后才停止本轮。
   max_consecutive_failures: 2
-  # 补充搜索只向 Blue 暴露少量、可确定绑定引用编号的候选来源。
+  # 补充搜索只向 Repairer 暴露少量、可确定绑定引用编号的候选来源。
   max_candidate_sources: 3
-  # 字符预算（不是 token）：Red 提升到 8k，局部 self-verify 提升到 6k。
-  # Blue 全文盲目扩到 6k/8k 的 live smoke 出现外部指标回归，因此默认维持
+  # 字符预算（不是 token）：Critic 提升到 8k，局部 self-verify 提升到 6k。
+  # Repairer 全文盲目扩到 6k/8k 的 live smoke 出现外部指标回归，因此默认维持
   # 4k，并保留配置入口供后续异构模型和 issue-centered context 实验。
-  red_context_chars: 8000
-  blue_context_chars: 4000
+  critic_context_chars: 8000
+  repairer_context_chars: 4000
   self_verify_context_chars: 6000
-  # Red 仅在单维度 JSON 无法解析时重试该维度；后端错误不重试。
-  red_dimension_parse_retries: 1
+  # Critic 仅在单维度 JSON 无法解析时重试该维度；后端错误不重试。
+  critic_dimension_parse_retries: 1
   # 对抗阶段同时受此超时和全局剩余时间约束。
   timeout_seconds: 180
-  red_max_tokens: 4096
-  blue_max_tokens: 4096
-  # Blue Agent 输出质量分阈值，达到此分即可提前终止对抗
+  critic_max_tokens: 4096
+  repairer_max_tokens: 4096
+  # Repairer Agent 输出质量分阈值，达到此分即可提前终止对抗
   score_threshold: 9.5
   # 相邻两轮评分差异阈值，低于此值视为收敛，提前终止
   delta_threshold: 0.2

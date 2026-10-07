@@ -97,6 +97,7 @@ class Orchestrator:
         self._reusable_results: dict[str, AgentResult] = {}
         self._research_graph: Any | None = None
         self._facet_task_outcomes: dict[str, dict[str, AgentResult]] = {}
+        self._attempted_claims: set[str] = set()
 
         # 状态机处理器映射
         self._state_handlers: dict[OrchestratorState, Callable[[], asyncio.Future[OrchestratorState]]] = {
@@ -128,6 +129,8 @@ class Orchestrator:
         """
         self._query = query
         self._config = config or RunConfig()
+        self.budget_tracker.reset()
+        self.budget_tracker.set_budget_limit(self._config.token_budget)
         self._start_time = time.monotonic()
         self._replan_count = 0
         self._adversarial_count = 0
@@ -138,6 +141,7 @@ class Orchestrator:
         self._reusable_results.clear()
         self._research_graph = None
         self._facet_task_outcomes.clear()
+        self._attempted_claims.clear()
         self._memory_store.clear()
         self._results.clear()
         self._historical_results.clear()
@@ -566,6 +570,7 @@ class Orchestrator:
             >= self._config.evidence_replan_threshold
             and self._config.enable_replan
             and self._replan_count < self._config.max_replan_rounds
+            and self.budget_tracker.get_usage() < self._config.token_budget
         ):
             targeted_tasks = self._prepare_evidence_gap_tasks(verification_summary)
             if targeted_tasks:
@@ -594,7 +599,7 @@ class Orchestrator:
         return OrchestratorState.DONE
 
     async def _do_adversarial(self) -> OrchestratorState:
-        """M5: Red-Blue 对抗降噪循环。
+        """M5: Critic-Repairer 对抗降噪循环。
 
         调用 AdversarialLoop 对报告进行 challenge-verify 迭代优化。
         仅在报告置信度低于阈值时触发，避免资源浪费。
@@ -616,27 +621,38 @@ class Orchestrator:
             report.adversarial_reason = "adversarial_backend_not_configured"
             return OrchestratorState.DONE
 
+        # A reused REPL must not recover another query's checkpoint when the
+        # global deadline is already exhausted before this loop can start.
+        self.adversarial_loop.best_report = None
+        self.adversarial_loop.last_history = []
         try:
-            print(f"[Adversarial] ▶ 启动 Red-Blue 对抗优化 (当前置信度={report.confidence:.2f})")
+            print(f"[Adversarial] ▶ 启动 Critic-Repairer 对抗优化 (当前置信度={report.confidence:.2f})")
             elapsed = time.monotonic() - self._start_time
             remaining_global = self._config.global_timeout_seconds - elapsed
             timeout = min(self._config.adversarial_timeout_seconds, remaining_global)
             if timeout <= 0:
                 raise asyncio.TimeoutError("global timeout reached before adversarial stage")
+            self.adversarial_loop.time_budget_seconds = timeout
             optimized_report, history = await asyncio.wait_for(
                 self.adversarial_loop.run(report), timeout=timeout
             )
             self._memory_store["final_report"] = optimized_report
+            optimized_report.adversarial_history = history
             self._adversarial_count += len(history)
             if getattr(optimized_report, "adversarial_status", "success") in {"skipped", "failed", "rejected"}:
                 print(f"[Adversarial] SKIPPED: {optimized_report.adversarial_reason}")
             else:
                 print(f"[Adversarial] ✓ 对抗优化完成: {len(history)} 轮, 最终置信度={optimized_report.confidence:.2f}")
         except asyncio.TimeoutError:
-            report.adversarial_status = "skipped"
+            checkpoint = getattr(self.adversarial_loop, "best_report", None)
+            if checkpoint is not None and checkpoint.adversarial_rounds > 0:
+                report = checkpoint
+                self._memory_store["final_report"] = report
+            report.adversarial_history = list(getattr(self.adversarial_loop, "last_history", []))
+            self._adversarial_count += len(report.adversarial_history)
+            report.adversarial_status = "partial" if report.adversarial_rounds > 0 else "skipped"
             report.adversarial_reason = "adversarial_timeout"
-            report.adversarial_rounds = 0
-            print("[Adversarial] SKIPPED: adversarial_timeout，使用原始报告")
+            print("[Adversarial] Timeout: preserving last accepted report")
         except Exception as e:
             report.adversarial_status = "skipped"
             report.adversarial_reason = str(e)
@@ -1146,12 +1162,8 @@ class Orchestrator:
             ]
             report.evidence_verification = summary
             report.open_questions = list(summary["unresolved_claims"])
-            if summary.get("total_claims", 0):
-                report.confidence = round(
-                    report.confidence
-                    * (0.5 + 0.5 * summary.get("support_rate", 0.0)),
-                    2,
-                )
+            from ..evidence.confidence import calibrate
+            calibrate(report, summary)
             return summary
         except Exception as exc:
             self._decision_trace.append(DecisionRecord(
@@ -1166,7 +1178,13 @@ class Orchestrator:
         unresolved = summary.get("unresolved_claims", [])
         if not isinstance(unresolved, list):
             return []
-        actionable = [item for item in unresolved if isinstance(item, dict) and str(item.get("text", "")).strip()]
+        import re
+        def claim_key(item):
+            text = re.sub(r"\[\d+\]|[\s*#>]+", "", str(item.get("text", ""))).lower()
+            return hashlib.sha256(text.encode()).hexdigest()
+        actionable = [item for item in unresolved if isinstance(item, dict)
+                      and str(item.get("text", "")).strip()
+                      and claim_key(item) not in self._attempted_claims]
         actionable.sort(
             key=lambda item: (
                 0 if item.get("status") == "contradicted" else 1,
@@ -1182,6 +1200,7 @@ class Orchestrator:
         selected = actionable[:limit]
         if not selected:
             return []
+        self._attempted_claims.update(claim_key(item) for item in selected)
 
         existing_ids = {result.task_id for result in self._historical_results}
         self._historical_results.extend(

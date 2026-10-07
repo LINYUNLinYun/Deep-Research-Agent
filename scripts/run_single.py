@@ -17,8 +17,11 @@ import asyncio
 import logging
 import os
 import sys
+import json
+from dataclasses import asdict
+from pathlib import Path
 
-from src.core.runner import initialize_modules, load_config, run_research, save_report, setup_logging
+from src.core.runner import initialize_modules, load_config, run_research, save_report, setup_logging, collect_harness_telemetry
 
 
 def main() -> None:
@@ -77,6 +80,10 @@ def main() -> None:
         report = asyncio.run(run_research(args.query, config, modules))
 
         filepath = save_report(report, args.query, args.output_dir)
+        artifact = Path(filepath).with_suffix(".json")
+        artifact.write_text(json.dumps({"report": asdict(modules["last_report"]),
+                                       "telemetry": collect_harness_telemetry(modules)},
+                                      ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         logger.info(f"报告已保存: {filepath}")
 
         print("\n" + "=" * 60)

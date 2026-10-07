@@ -23,7 +23,7 @@
 
 ### 1.1 一句话定位
 
-一个 **Query → 结构化 Markdown 研究报告** 的全链路自动化 Agent 系统：`Planner` 把复杂问题拆成 DAG，`Orchestrator`（自研 asyncio 状态机）并发调度多个 Worker Agent 检索信息，`Summarizer` 合成报告，`Red/Blue` 对抗降噪，`Memory`/`Compressor` 做记忆与长上下文管理，另有一套评测体系 + 预留的自进化框架。
+一个 **Query → 结构化 Markdown 研究报告** 的全链路自动化 Agent 系统：`Planner` 把复杂问题拆成 DAG，`Orchestrator`（自研 asyncio 状态机）并发调度多个 Worker Agent 检索信息，`Summarizer` 合成报告，`Critic/Repairer` 对抗降噪，`Memory`/`Compressor` 做记忆与长上下文管理，另有一套评测体系 + 预留的自进化框架。
 
 ### 1.2 分层视图
 
@@ -40,7 +40,7 @@
 ├──────────────────────────────────────────────────────────────────────┤
 │ 支撑能力 src/memory/          跨 Agent 共享记忆（去重/矛盾/淘汰）     │
 │          src/compressor/      L1/L2/L3 语义压缩                      │
-│          src/adversarial/     Red-Blue 对抗降噪                      │
+│          src/adversarial/     Critic-Repairer 对抗降噪               │
 │          src/evolution/       在线自进化框架（默认关闭）             │
 ├──────────────────────────────────────────────────────────────────────┤
 │ 基础设施 src/tools/           7 个检索/计算/读写工具                  │
@@ -74,7 +74,7 @@
    ▼
 scripts/run_single.py ──► runner.load_config() ──► runner.initialize_modules()   # 装配（见 §4.1）
    │        # 初始化顺序：ModelRouter → Planner → Compressor → Memory → Tools
-   │        #            → Red/Blue/AdversarialLoop → AgentPool → Orchestrator
+   │        #            → Critic/Repairer/AdversarialLoop → AgentPool → Orchestrator
    ▼
 runner.run_research(query, config, modules)                  # src/core/runner.py
    │  构造 RunConfig（并发度/超时/重规划上限/开关）
@@ -98,7 +98,7 @@ Orchestrator.run(query, config)                              # src/orchestrator/
    │  │                       EvidenceVerifier 做 claim-source 对齐；缺口可补规划
    │  │   ├─ enable_adversarial ─► ADVERSARIAL
    │  │   └─ 否则 ─► DONE
-   │  │  ADVERSARIAL          配置化 gate；Red/Blue 修复后重新评分
+   │  │  ADVERSARIAL          配置化 gate；Critic/Repairer 修复后重新评分
    │  │                       ─► DONE
    │  │  DONE / FAILED        终态
    │  └────────────────────────────────────────────────────────────────────────────┘
@@ -108,7 +108,7 @@ runner._format_report() ─► Markdown（正文 + 元信息 + 参考来源）  
 runner.save_report() ─► outputs/reports/report_YYYYMMDD_HHMMSS_<query前20字>.md
 ```
 
-> ⚠️ **注意**：上图是**代码实际顺序**。README 的数据流图把「对抗」画在「合成」之前，与代码相反——实际是 **先 Summarizer 合成整篇报告，再对整篇做 Red/Blue 对抗**（[orchestrator.py:429](src/orchestrator/orchestrator.py#L429) `_do_synthesizing` 返回 `ADVERSARIAL` 态）。
+> ⚠️ **注意**：上图是**代码实际顺序**。README 的数据流图把「对抗」画在「合成」之前，与代码相反——实际是 **先 Summarizer 合成整篇报告，再对整篇做 Critic/Repairer 对抗**（[orchestrator.py:429](src/orchestrator/orchestrator.py#L429) `_do_synthesizing` 返回 `ADVERSARIAL` 态）。
 
 ### 2.2 Worker Agent 内部的多轮 tool-calling
 
@@ -131,7 +131,7 @@ ResearcherAgent.run(subtask, context)          # src/agents/researcher.py
 ```raw
 ├── configs/                       # YAML 配置中心
 │   ├── default.yaml               # 全局唯一生效配置：模型路由/采样/各模块开关与阈值
-│   ├── agents/                    # researcher/red_agent/blue_agent Prompt 规范（⚠️ 未被代码加载）
+│   ├── agents/                    # researcher/critic_agent/repairer_agent Prompt 规范（⚠️ 未被代码加载）
 │   ├── planner/planner.yaml       # Planner Prompt 与 DAG 约束（⚠️ 未被代码加载）
 │   ├── tools/                     # 各工具的声明式参数参考（⚠️ 未被代码加载）
 │   └── evolution/                 # grpo_online / reward_shaping（⚠️ 与代码 key 不匹配，参考用）
@@ -184,7 +184,7 @@ ResearcherAgent.run(subtask, context)          # src/agents/researcher.py
 | 3 | ContextCompressor | `compressor_policy` |
 | 4 | SharedMemoryStore（session 隔离） | — |
 | 5 | 7 个 Tools（mock/真实由 `tools.web_search.mock_mode` 决定） | — |
-| 6 | RedAgent / BlueAgent / AdversarialLoop | `red/blue/judge_policy` |
+| 6 | CriticAgent / RepairerAgent / AdversarialLoop | `critic/repairer/judge_policy` |
 | 7 | AgentPool + Orchestrator（注入上面全部） | `solver_policy` |
 
 ---
@@ -291,21 +291,21 @@ ShortTermMemory（独立对话历史，⚠️ 当前全项目无调用方）
 
 ---
 
-### 4.7 `src/adversarial/` — M5 Red-Blue 对抗降噪
+### 4.7 `src/adversarial/` — M5 Critic-Repairer 对抗降噪
 
 **职责**：对**已合成的整篇报告**做「攻击-修复-评分」迭代，主动压低幻觉与逻辑问题（灵感来自 GAN，应用于文本质量）。
 
 | 文件 | 类 | 职责 |
 |---|---|---|
-| [red_agent.py](src/adversarial/red_agent.py) | `RedAgent` | 五维度攻击方 |
-| [blue_agent.py](src/adversarial/blue_agent.py) | `BlueAgent` | 修复方 + `self_verify` |
-| [verdict.py](src/adversarial/verdict.py) | `VerdictEngine` + `Issue`/`RedVerdict`/`FixOperation` | 评分模型、优先级、JSON 序列化 |
-| [loop.py](src/adversarial/loop.py) | `AdversarialLoop` | Red→Blue→评分 主循环 + 收敛/震荡控制 |
+| [critic_agent.py](src/adversarial/critic_agent.py) | `CriticAgent` | 五维度攻击方 |
+| [repairer_agent.py](src/adversarial/repairer_agent.py) | `RepairerAgent` | 修复方 + `self_verify` |
+| [verdict.py](src/adversarial/verdict.py) | `VerdictEngine` + `Issue`/`CriticVerdict`/`FixOperation` | 评分模型、优先级、JSON 序列化 |
+| [loop.py](src/adversarial/loop.py) | `AdversarialLoop` | Critic→Repairer→评分 主循环 + 收敛/震荡控制 |
 
-**Red 攻击五维度与权重**（[verdict.py:188-194](src/adversarial/verdict.py#L188-L194)）：
+**Critic 攻击五维度与权重**（[verdict.py:188-194](src/adversarial/verdict.py#L188-L194)）：
 `FACTUAL 事实性 0.30 / HALLUCINATION 幻觉 0.25 / LOGICAL 逻辑 0.20 / SOURCE_CREDIBILITY 来源可信 0.15 / COVERAGE 覆盖 0.10`，每维独立 LLM Prompt，JSON 四层容错解析。
 
-**Blue 修复操作**（按优先级 `severity_weight × dimension_weight × fix_difficulty` 降序逐个处理）：
+**Repairer 修复操作**（按优先级 `severity_weight × dimension_weight × fix_difficulty` 降序逐个处理）：
 - `IN_PLACE`（难度1.0）：数字/日期/人名与来源不一致 → 直接替换；
 - `SUPPLEMENTARY`（难度0.6）：无来源 claim → 先搜索补证，无法证实则标注"未经证实"；
 - `REMOVAL`（难度0.8）：高置信幻觉 → 删除段落；
@@ -366,7 +366,7 @@ ShortTermMemory（独立对话历史，⚠️ 当前全项目无调用方）
 | [model_router.py](src/models/model_router.py) | `ModelRouter` | 从 `.env` 读 `{PREFIX}_API_KEY/_BASE_URL/_MODEL` 建后端；实例缓存；支持任意 OpenAI 兼容后端 |
 | [vllm_policy.py](src/models/vllm_policy.py) | `VLLMPolicy` / `OpenAICompatibleDict` | 所有后端落到的**统一 LLM 封装**：消息清洗（修复元组/防 task 泄露/合并连续同角色）、35000 字符截断、原生 tool_calls + `<tool_call>` 标签正则兜底解析、错误分类（context length 错误中止轨迹，网络抖动返回假 assistant 继续） |
 
-**模块级分工**（`configs/default.yaml:99-107`）：`solver/planner/summarizer → deepseek`（强推理/大输出），`judge/red_agent/blue_agent/compressor → mimo`（稳定低成本）。未在映射中的模块回退 `default_policy`。
+**模块级分工**（`configs/default.yaml:99-107`）：`solver/planner/summarizer → deepseek`（强推理/大输出），`judge/critic_agent/repairer_agent/compressor → mimo`（稳定低成本）。未在映射中的模块回退 `default_policy`。
 
 **采样参数集中管理**（[default.yaml:58-94](configs/default.yaml#L58)）：`model.backend_sampling` = 后端全局默认（deepseek: temp0.7/max_tokens4096，mimo: temp0.3）+ `modules` 级覆盖（如 judge temp0.1 保评分一致、summarizer max_tokens 16384 容纳长报告）。优先级：模块覆盖 > YAML 后端默认 > 内置默认。
 
@@ -426,7 +426,7 @@ ShortTermMemory（独立对话历史，⚠️ 当前全项目无调用方）
 | `tools` | web_search(mock_mode)/arxiv_reader/code_sandbox 的开关与参数 |
 
 **⚠️ 只读参考、未被代码加载的 YAML**（代码中 Prompt 硬编码，这些文件更像"规范文档"）：
-`configs/agents/researcher.yaml`、`red_agent.yaml`、`blue_agent.yaml`（含很详细的攻击维度/评分框架/修复模板）、`configs/planner/planner.yaml`、`configs/tools/*.yaml`。其中 red_agent 的权重（0.30/0.20/0.20/0.15/0.15）与代码 `verdict.py` 的权重定义**并不一致**，修改时以代码为准。
+`configs/agents/researcher.yaml`、`critic_agent.yaml`、`repairer_agent.yaml`（含很详细的攻击维度/评分框架/修复模板）、`configs/planner/planner.yaml`、`configs/tools/*.yaml`。其中 critic_agent 的权重（0.30/0.20/0.20/0.15/0.15）与代码 `verdict.py` 的权重定义**并不一致**，修改时以代码为准。
 
 **环境变量**：见 [.env.template](.env.template)——LLM 各后端 `{PREFIX}_API_KEY/_BASE_URL/_MODEL/_TEMPERATURE/_MAX_TOKENS`、搜索后端（SerpAPI/Bing/博查/秘塔）、`SEARCH_BACKEND`、arxiv 三后端、LangSmith、文件/沙箱限制等。
 
@@ -487,7 +487,7 @@ runner.py（唯一装配根，函数内延迟导入，避免循环依赖）
   ├─► planner.{planner,dag,budget_tracker} ─► orchestrator.schemas（SubTask）◄── 共享
   ├─► compressor.compressor ─► {extractive, summarizer, sliding_window} + models(policy)
   ├─► memory.memory_store ─► {long_term, embedder}
-  ├─► adversarial.{loop,red_agent,blue_agent} + verdict（依赖 orchestrator.schemas.ResearchReport）
+  ├─► adversarial.{loop,critic_agent,repairer_agent} + verdict（依赖 orchestrator.schemas.ResearchReport）
   └─► orchestrator.orchestrator ─► {schemas, agent_pool}
         agent_pool ─► agents.{base,researcher,summarizer}
         orchestrator（SYNTHESIZING 态）─► agents.summarizer
@@ -511,7 +511,7 @@ harness_evolution/ ─► SearchController / EvidenceVerifier + immutable Regist
 2. **编排器 = 装配 + 调度分离**：`runner.initialize_modules` 做全部依赖注入，子模块互不直接 import，便于替换/消融单个模块（消融实验正是靠关掉某个注入实现）。
 3. **记忆走"语义"而非"KV"**：写入去重、矛盾检测、按质量分淘汰，都是为了让长时程研究的跨 Agent 共享**不是简单的丢进 prompt**，而是可检索的结论库。
 4. **压缩从"过滤"到"提取"到"抽象"渐进**：先用便宜的 cosine 过滤，再 TextRank 提取，最后才动用 LLM 摘要；越贵的操作触发越靠后。
-5. **对抗用于"事后纠偏"**：Red-Blue 放在整篇报告合成之后，而不是每个子任务内，避免成本爆炸；用置信度门控 + 收敛/震荡检测控制预算。
+5. **对抗用于"事后纠偏"**：Critic-Repairer 放在整篇报告合成之后，而不是每个子任务内，避免成本爆炸；用置信度门控 + 收敛/震荡检测控制预算。
 6. **多后端路由 + mock 开关**：模块级选模型（推理/成本/稳定性分流）+ 模块级采样参数集中管理；`mock_mode` 让无 key 也能跑通全链路 demo 与评测。
 
 ---
@@ -524,7 +524,7 @@ harness_evolution/ ─► SearchController / EvidenceVerifier + immutable Regist
 
 | # | 不一致 | 以代码为准的真相 |
 |---|---|---|
-| A1 | README 数据流把对抗画在合成之前 | 实际是 **先 Summarizer 合成 → 再对整篇 Red/Blue 对抗**（[orchestrator.py:429](src/orchestrator/orchestrator.py#L429)、[orchestrator.py:435](src/orchestrator/orchestrator.py#L435)） |
+| A1 | README 数据流把对抗画在合成之前 | 实际是 **先 Summarizer 合成 → 再对整篇 Critic/Repairer 对抗**（[orchestrator.py:429](src/orchestrator/orchestrator.py#L429)、[orchestrator.py:435](src/orchestrator/orchestrator.py#L435)） |
 | A2 | README 称对抗"评分达标 ≥8.0 / 3 轮上限" | 那是 AdversarialLoop **类默认值**；实际注入的是 `configs/default.yaml` 的 **max_rounds=10 / score_threshold=9.5 / delta=0.2**（[runner.py:233-235](src/core/runner.py#L233-L235)）；且进不进对抗另由合成置信度 <0.8 门控 |
 | A3 | `configs/agents/*.yaml`、`planner/*.yaml`、`tools/*.yaml`、`reward_shaping.yaml` | 均**无代码加载**（Prompt 硬编码在 .py 内），属参考文档；改 Prompt 需改源码 |
 | A4 | research_bench 文件头注释"20 道" | 实际 **35 题 / 11 领域** |

@@ -323,7 +323,7 @@ class RuleBasedMetrics:
         """
         基于多维度指标和权重计算加权综合得分。
 
-        默认权重与 Red Agent 的五维度对齐：
+        默认权重与 Critic Agent 的五维度对齐：
         - factual_accuracy: 0.25
         - logical_consistency: 0.20
         - citation_coverage: 0.20

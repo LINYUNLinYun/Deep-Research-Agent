@@ -173,7 +173,16 @@ class ContextCompressor:
             )
             # 将文本列表合并为消息格式进行截断
             messages = [{"role": "user", "content": t} for t in compressed]
-            truncated_msgs = self.sliding.compress(messages)
+            # The caller may reserve space for the task and other tool results.
+            # Use this call's budget instead of the constructor's full budget;
+            # a local fallback also avoids changing shared worker state.
+            sliding = SlidingWindowCompressor(
+                max_tokens=actual_budget,
+                char_per_token=self.chars_per_token,
+                min_recent_turns=1,
+                min_last_msg_chars=max(1, min(500, int(actual_budget * self.chars_per_token) - 100)),
+            )
+            truncated_msgs = sliding.compress(messages)
             compressed = [m["content"] for m in truncated_msgs]
 
         self._record_stats(texts, compressed, level, self.calculate_tokens(compressed))

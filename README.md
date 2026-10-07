@@ -14,7 +14,7 @@ Deep Research Agent 是一个用于长链路研究任务的 Python 实验框架�
 - **DAG 研究编排**：Planner 将问题拆成有依赖关系的子任务，Orchestrator 按拓扑层并发执行；失败、超时和证据不足可以触发有界重规划。
 - **证据链路**：检索结果写入 lossless Evidence Ledger，使用稳定 source ID 连接来源、claim 和最终引用；模型侧只接收有数量与字符上限的证据目录。
 - **搜索预算控制**：区分单任务限额和整次运行限额，记录 query rewrite、provider fallback、重复率和调用量等 telemetry。
-- **报告校验与修复**：可选的 claim-level 证据验证会标记 supported、unsupported 和 conflict；Red/Blue 流程用于发现问题并做受限修复。
+- **报告校验与修复**：可选的 claim-level 证据验证会标记 supported、unsupported 和 conflict；Critic/Repairer 流程用于发现问题并做受限修复。
 - **多后端模型路由**：Planner、Researcher、Summarizer、Judge 等模块可以分别选择 DeepSeek、MiMo、OpenAI 兼容接口或本地 vLLM。
 - **评测与消融**：包含 ResearchBench、HotpotQA 适配、规则指标、LLM Judge、paired evaluation、bootstrap 置信区间和模块消融脚本。
 
@@ -70,7 +70,7 @@ Query
   -> Compressor 控制上下文预算
   -> Summarizer 生成报告与引用
   -> Claim-Evidence 验证；必要时局部 replan
-  -> 可选 Red/Blue 审查与修复
+  -> 可选 Critic/Repairer 审查与修复
   -> Report + telemetry
 ```
 
@@ -136,7 +136,7 @@ REPL 会在同一 session 中复用模块和记忆，支持 `sessions`、`ls`、
 | `planner` | 规划重试、证据增益阈值和 Research State 开关 |
 | `compressor` | 上下文长度、输出保留量和多级压缩阈值 |
 | `memory` | SQLite 路径、session 隔离、去重和检索参数 |
-| `adversarial` | Red/Blue 轮数、超时、修复范围和证据验证 |
+| `adversarial` | Critic/Repairer 轮数、超时、修复范围和证据验证 |
 | `summarizer` | 模型侧来源目录的数量与字符预算 |
 | `tools.search_control` | query 去重、rewrite 和 run-level provider 上限 |
 | `harness_evolution` | registry 位置与线上使用的策略版本 |
@@ -206,7 +206,7 @@ src/agents/                 Researcher 与 Summarizer
 src/orchestrator/           状态机、DAG 调度和结果汇总
 src/planner/                Planner、预算追踪和 ResearchStateGraph
 src/evidence/               Evidence Ledger、schema 和 claim verifier
-src/adversarial/            Red/Blue 审查与修复
+src/adversarial/            Critic/Repairer 审查与修复
 src/harness_evolution/      registry、replay、candidate 和 promotion gate
 src/memory/                 session memory 与向量检索
 src/models/                 模型路由和 vLLM 策略
@@ -221,7 +221,7 @@ tests/                      单元与回归测试
 
 - 这是研究代码，配置和接口仍可能变化。
 - 引用与 claim verifier 能提高可追踪性，但不能保证来源本身正确，也不能替代人工核查。
-- Red/Blue 修复会增加模型调用，是否提升最终质量取决于模型、问题和证据质量。
+- Critic/Repairer 修复会增加模型调用，是否提升最终质量取决于模型、问题和证据质量。
 - Research State 目前只做 shadow 观测，尚未接管 follow-up DAG 或停止决策。
 - Harness Evolution 是离线、受门控的策略迭代，不是在线自动训练系统。
 - 使用实时 provider 的实验无法天然复现；严肃比较需要固定数据、fixture 和运行顺序。

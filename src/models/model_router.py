@@ -8,7 +8,7 @@
 
 设计要点:
   1. 零源码修改切换后端：所有敏感信息（API Key / URL）都放在 .env 文件中
-  2. 运行时热切换：不同模块可以用不同后端（如 Red Agent 用 cheap 模型，Solver 用 strong 模型）
+  2. 运行时热切换：不同模块可以用不同后端（如 Critic Agent 用 cheap 模型，Solver 用 strong 模型）
   3. 向后兼容：保留 VLLMPolicy 的所有接口和行为，只扩展初始化方式
 
 用法示例:
@@ -20,7 +20,7 @@
   >>> # 获取所有可用后端，按场景分配
   >>> backends = ModelRouter.get_all_backends()
   >>> solver_policy = backends["deepseek"]
-  >>> red_policy = backends["vllm"]  # 本地模型，攻击成本低
+  >>> critic_policy = backends["vllm"]  # 本地模型，攻击成本低
 """
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ class ModelRouter:
             backend_names: 指定要扫描的后端名称列表。为 None 时扫描全部已知后端
                           （deepseek, vllm, openai, mimo 及任何自定义前缀）。
 
-        常用于"主模型用 DeepSeek，Red Agent 用 MiMo"的场景。
+        常用于"主模型用 DeepSeek，Critic Agent 用 MiMo"的场景。
         """
         ensure_env_loaded()
         backends: dict[str, VLLMPolicy] = {}

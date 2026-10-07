@@ -89,7 +89,7 @@ def traceable(
         metadata: 附加元数据字典。
 
     用法示例：
-        @traceable(run_type="agent", tags=["m5", "red"])
+        @traceable(run_type="agent", tags=["m5", "critic"])
         async def attack(self, report): ...
     """
     def decorator(func: Callable) -> Callable:

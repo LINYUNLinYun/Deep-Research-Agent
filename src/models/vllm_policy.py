@@ -78,10 +78,10 @@ class VLLMPolicy:
         self.tools = tools
 
     def _truncate_messages(self, messages: list, max_chars: int = 35000) -> list:
-        """主动截断：保留 system + 最近交互，逐步丢弃旧轮次。
+        """主动截断：保留 system、原始任务和最新完整工具交互。
 
         阈值 35000 字符 ≈ 11-12K content tokens（ratio 2.5-3.0 + overhead + tool metadata）。
-        截断是"丢弃旧轮次"而非截断内容，避免在消息中间切断导致语义破碎。
+        优先丢弃旧轮次；最新交互超限时缩减内容，保留工具调用配对。
         """
         system_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
         other_msgs = [m for m in messages if not (isinstance(m, dict) and m.get("role") == "system")]
@@ -113,36 +113,44 @@ class VLLMPolicy:
         print(f"[TRUNCATE] Triggered: {before_chars} chars > {max_chars} threshold. n_msgs={len(messages)}")
         print(f"[TRUNCATE] System msgs: {len(system_msgs)}, Other msgs: {len(other_msgs)}")
 
-        # 策略：从 other_msgs 的头部开始丢弃旧消息，保留最近交互
-        # 但保证至少保留 system + 最近 3 条（否则上下文完全丢失）
-        # 关键：不能拆开 assistant(tool_calls) 和后面紧跟的 tool 消息
-        kept = list(other_msgs)
-        while len(kept) > 3:
-            removed = kept.pop(0)
-            # 如果丢弃了带 tool_calls 的 assistant，后面连续的 tool 消息也必须一起丢
-            if isinstance(removed, dict) and removed.get("role") == "assistant" and removed.get("tool_calls"):
-                while kept and isinstance(kept[0], dict) and kept[0].get("role") == "tool":
-                    kept.pop(0)
-            after_chars = _count_chars(system_msgs + kept)
-            if after_chars <= max_chars:
-                print(f"[TRUNCATE] Reduced to {after_chars} chars, kept {len(kept)} non-system msgs")
-                return system_msgs + kept
+        # Pin the original task and keep the latest complete interaction.
+        task_index = next((i for i, m in enumerate(other_msgs)
+                           if isinstance(m, dict) and m.get("role") == "user"), None)
+        pinned = [other_msgs[task_index]] if task_index is not None else []
+        remaining = [m for i, m in enumerate(other_msgs) if i != task_index]
+        groups = []
+        for message in remaining:
+            if (isinstance(message, dict) and message.get("role") == "tool"
+                    and groups and isinstance(groups[-1][0], dict)
+                    and groups[-1][0].get("tool_calls")):
+                groups[-1].append(message)
+            else:
+                groups.append([message])
 
-        # 极端情况：即使只保留 system + 最后 3 条也超阈值
-        # 对最后一条（最新的交互）做内容级截断兜底
-        after_chars = _count_chars(system_msgs + kept)
-        if after_chars > max_chars and kept:
-            # 截断最后一条 message 的 content（通常是超长的 tool result）
-            last_msg = kept[-1]
-            excess = after_chars - max_chars
-            content = str(last_msg.get("content", ""))
-            new_len = max(len(content) - excess - 100, 500)  # 留 100 字符缓冲，至少保留 500
-            last_msg["content"] = content[:new_len] + "\n[CONTENT_TRUNCATED]"
-            final_chars = _count_chars(system_msgs + kept)
-            print(f"[TRUNCATE] Content-truncated last msg to {new_len} chars. Final: {final_chars}")
-            return system_msgs + kept
+        def assembled():
+            return system_msgs + pinned + [m for group in groups for m in group]
 
-        return system_msgs + kept
+        while len(groups) > 1 and _count_chars(assembled()) > max_chars:
+            groups.pop(0)
+        kept = [dict(m) if isinstance(m, dict) else m for m in assembled()]
+        # Shrink payloads without deleting the latest tool group or mutating
+        # caller-owned evidence. Protocol fields remain unchanged.
+        candidates = [m for m in kept if isinstance(m, dict) and m.get("role") == "tool"]
+        candidates += [m for m in kept if isinstance(m, dict) and m.get("role") not in ("system", "tool")]
+        for message in candidates:
+            excess = _count_chars(kept) - max_chars
+            if excess <= 0:
+                break
+            content = str(message.get("content", ""))
+            marker = "\n[CONTENT_TRUNCATED]"
+            if len(content) > len(marker) + 1:
+                new_len = max(1, len(content) - excess - len(marker))
+                message["content"] = content[:new_len] + marker
+        final_chars = _count_chars(kept)
+        if final_chars > max_chars:
+            raise RuntimeError("Context budget cannot fit system prompt and tool-call metadata")
+        print(f"[TRUNCATE] Reduced to {final_chars} chars, preserved task and latest interaction")
+        return kept
 
     def __call__(self, messages: list) -> OpenAICompatibleDict:
         """调用 LLM，返回 OpenAI 兼容格式消息。

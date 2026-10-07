@@ -41,12 +41,12 @@ model:
         max_tokens: 16384
         top_p: 1.0
         thinking: false
-      red_agent:
+      critic_agent:
         temperature: 0
         max_tokens: 4096
         top_p: 1.0
         thinking: false
-      blue_agent:
+      repairer_agent:
         temperature: 0
         max_tokens: 4096
         top_p: 1.0
@@ -66,8 +66,8 @@ model:
     planner: deepseek
     summarizer: deepseek
     judge: deepseek
-    red_agent: deepseek
-    blue_agent: deepseek
+    critic_agent: deepseek
+    repairer_agent: deepseek
     compressor: deepseek
 
 orchestrator:
@@ -122,13 +122,13 @@ memory:
   recency_half_life_days: 30
 
 adversarial:
-  # Red-Blue is intentionally disabled until its issue/call budgets are fixed.
+  # Critic-Repairer is intentionally disabled until its issue/call budgets are fixed.
   enabled: false
   max_rounds: 1
   score_threshold: 9.5
   delta_threshold: 0.2
   confidence_gate: 0.8
-  # Numeric Verification remains active before the Red-Blue branch.
+  # Numeric Verification remains active before the Critic-Repairer branch.
   evidence_verification_enabled: true
   max_verified_claims: 10
   evidence_min_overlap: 0.32
